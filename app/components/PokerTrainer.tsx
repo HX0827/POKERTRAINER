@@ -166,6 +166,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const [apiReady, setApiReady] = useState(false);
   const [thinking, setThinking] = useState("");
   const [copied, setCopied] = useState(false);
+  const [clearStatus, setClearStatus] = useState<"idle" | "clearing" | "cleared" | "error">("idle");
   const sessionId = useRef(`S${Date.now().toString(36)}`);
   const loggedHand = useRef(0);
   const decisionToken = useRef(0);
@@ -315,6 +316,22 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     link.download = `AI训练牌局日志_${new Date().toISOString().slice(0, 10)}.md`;
     link.click();
     URL.revokeObjectURL(link.href);
+  };
+
+  const clearLogs = async () => {
+    if (clearStatus === "clearing" || hands.length === 0) return;
+    const previousHands = hands;
+    setHands([]);
+    setClearStatus("clearing");
+    try {
+      const response = await fetch("/api/hands", { method: "DELETE" });
+      if (!response.ok) throw new Error("Clear failed");
+      setClearStatus("cleared");
+      window.setTimeout(() => setClearStatus("idle"), 1500);
+    } catch {
+      setHands(previousHands);
+      setClearStatus("error");
+    }
   };
 
   return (
@@ -535,6 +552,19 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
           <div className="log-actions">
             <button onClick={copyLogs}>{copied ? "已复制" : "复制 Markdown"}</button>
             <button className="download" onClick={downloadLogs}>下载 .md</button>
+            <button
+              className="clear-logs"
+              onClick={clearLogs}
+              disabled={hands.length === 0 || clearStatus === "clearing"}
+            >
+              {clearStatus === "clearing"
+                ? "正在清空…"
+                : clearStatus === "cleared"
+                  ? "已清空"
+                  : clearStatus === "error"
+                    ? "清空失败 · 重试"
+                    : "一键清空记录"}
+            </button>
           </div>
           <p className="storage-note"><i /> 自动保存到私人训练记录</p>
         </aside>

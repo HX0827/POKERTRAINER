@@ -1051,6 +1051,24 @@ kbd {
   background: #d6a83f;
 }
 
+.log-actions .clear-logs {
+  grid-column: 1 / -1;
+  min-height: 32px;
+  height: 32px;
+  color: #e87979;
+  border-color: rgba(232, 83, 83, 0.35);
+  background: rgba(116, 30, 28, 0.18);
+}
+
+.log-actions .clear-logs:disabled {
+  color: #646970;
+  border-color: rgba(255, 255, 255, 0.06);
+  background: #181b20;
+  cursor: default;
+  filter: none;
+  transform: none;
+}
+
 .storage-note {
   margin: -5px 0 9px;
   display: flex;

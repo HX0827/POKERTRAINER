@@ -19,6 +19,8 @@ test("Mist Table product shell replaces the disposable starter", async () => {
   assert.match(trainer, /黑雾训练桌/);
   assert.match(trainer, /迷雾开启/);
   assert.match(trainer, /逐手记录/);
+  assert.match(trainer, /一键清空记录/);
+  assert.match(trainer, /method: "DELETE"/);
   assert.match(hosting, /"d1": "DB"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.doesNotMatch(page, /SkeletonPreview|codex-preview/);

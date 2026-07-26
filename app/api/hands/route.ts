@@ -88,3 +88,13 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Could not save hand" }, { status: 503 });
   }
 }
+
+export async function DELETE() {
+  try {
+    await ensureSchema();
+    const result = await env.DB.prepare("DELETE FROM poker_hands").run();
+    return NextResponse.json({ ok: true, deleted: result.meta.changes ?? 0 });
+  } catch {
+    return NextResponse.json({ error: "Could not clear hand records" }, { status: 503 });
+  }
+}
