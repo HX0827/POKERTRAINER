@@ -10,7 +10,14 @@ interface RequestBody {
     prompt?: string;
   };
   observation?: BotObservation;
+  api?: {
+    apiKey?: string;
+    model?: string;
+  };
 }
+
+const DEEPSEEK_API_BASE = "https://api.deepseek.com";
+const ALLOWED_DEEPSEEK_MODELS = new Set(["deepseek-v4-pro", "deepseek-v4-flash"]);
 
 function sanitizeDecision(
   value: unknown,
@@ -29,15 +36,21 @@ function sanitizeDecision(
 }
 
 export async function POST(request: NextRequest) {
-  const apiKey = process.env.AI_API_KEY;
-  const model = process.env.AI_MODEL;
-  const apiBase = (process.env.AI_API_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-  if (!apiKey || !model) {
-    return NextResponse.json({ error: "AI API is not configured" }, { status: 503 });
-  }
-
   try {
     const body = (await request.json()) as RequestBody;
+    const browserApiKey = body.api?.apiKey?.trim();
+    const browserModel = body.api?.model?.trim();
+    const useBrowserDeepSeek = Boolean(
+      browserApiKey && browserModel && ALLOWED_DEEPSEEK_MODELS.has(browserModel),
+    );
+    const apiKey = useBrowserDeepSeek ? browserApiKey : process.env.AI_API_KEY;
+    const model = useBrowserDeepSeek ? browserModel : process.env.AI_MODEL;
+    const apiBase = useBrowserDeepSeek
+      ? DEEPSEEK_API_BASE
+      : (process.env.AI_API_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+    if (!apiKey || !model) {
+      return NextResponse.json({ error: "AI API is not configured" }, { status: 503 });
+    }
     const observation = body.observation;
     if (
       !observation ||
@@ -52,6 +65,10 @@ export async function POST(request: NextRequest) {
       "You are one seat in an 8-max no-limit Texas Hold'em training game.",
       "You may use only the private hole cards and public table information supplied below.",
       "Never infer or request hidden cards, the deck order, or other players' private state.",
+      "All chip values are raw table chips; the supplied big blind is 2 chips.",
+      "Use stack depth, effective stack, pot odds, SPR, raise depth, and public action history.",
+      "Do not reopen betting after a short all-in unless raise is present in legalActions.",
+      "Avoid implausible deep preflop raise wars without a premium range.",
       "Choose exactly one legal action. Return JSON only.",
       body.persona?.prompt || "Play a coherent poker strategy.",
     ].join(" ");
@@ -64,8 +81,9 @@ export async function POST(request: NextRequest) {
       },
       body: JSON.stringify({
         model,
-        temperature: 0.8,
-        max_tokens: 100,
+        temperature: 0.35,
+        max_tokens: 160,
+        ...(useBrowserDeepSeek ? { thinking: { type: "disabled" } } : {}),
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: system },

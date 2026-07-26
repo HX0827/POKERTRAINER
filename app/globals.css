@@ -29,7 +29,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -1100,7 +1101,7 @@ kbd {
 .persona-modal {
   width: min(850px, 95vw);
   max-height: 88vh;
-  overflow: hidden;
+  overflow-y: auto;
   border-radius: 16px;
   background: #13171b;
   border: 1px solid rgba(255,255,255,.1);
@@ -1121,13 +1122,183 @@ kbd {
   font-size: 10px;
 }
 
+.api-settings-card {
+  margin: 14px 14px 0;
+  overflow: hidden;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at 90% 0%, rgba(58, 221, 159, .08), transparent 36%),
+    #181d22;
+  border: 1px solid rgba(255,255,255,.08);
+}
+
+.api-settings-card.connected {
+  border-color: rgba(57, 220, 152, .27);
+}
+
+.api-settings-card.error {
+  border-color: rgba(225, 59, 53, .34);
+}
+
+.api-settings-copy {
+  padding: 12px 14px 10px;
+  display: grid;
+  grid-template-columns: 92px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+}
+
+.api-settings-copy > span {
+  color: #d2ad57;
+  font: 850 8px var(--font-data);
+  letter-spacing: .14em;
+}
+
+.api-settings-copy h3 {
+  margin: 0;
+  font-size: 12px;
+}
+
+.api-settings-copy p {
+  margin: 3px 0 0;
+  color: #7f8790;
+  font-size: 8px;
+}
+
+.api-settings-copy em {
+  color: #606a73;
+  font: normal 700 8px var(--font-data);
+}
+
+.api-settings-form {
+  padding: 11px 14px;
+  display: grid;
+  grid-template-columns: 180px minmax(240px, 1fr) 118px auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.api-settings-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.api-settings-form label > span {
+  color: #8f979f;
+  font-size: 8px;
+}
+
+.api-settings-form select,
+.api-key-field > div {
+  height: 36px;
+  border-radius: 8px;
+  color: #e5e7e8;
+  background: #0f1215;
+  border: 1px solid rgba(255,255,255,.1);
+}
+
+.api-settings-form select {
+  padding: 0 10px;
+  outline: none;
+}
+
+.api-key-field > div {
+  display: flex;
+  align-items: center;
+}
+
+.api-key-field input {
+  min-width: 0;
+  flex: 1;
+  height: 100%;
+  padding: 0 10px;
+  color: #e9ebec;
+  background: transparent;
+  border: 0;
+  outline: none;
+  font: 750 10px var(--font-data);
+}
+
+.api-key-field button {
+  height: 24px;
+  margin-right: 5px;
+  padding: 0 7px;
+  border-radius: 5px;
+  color: #8c959e;
+  background: #20262b;
+  border: 0;
+  font-size: 8px;
+  cursor: pointer;
+}
+
+.api-save-button,
+.api-remove-button {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.api-save-button {
+  color: #07130e;
+  background: #45dca0;
+  border: 0;
+}
+
+.api-save-button:disabled {
+  opacity: .55;
+  cursor: wait;
+}
+
+.api-remove-button {
+  color: #9ba2a9;
+  background: transparent;
+  border: 1px solid rgba(255,255,255,.1);
+}
+
+.api-settings-status {
+  padding: 0 14px 11px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #7f8992;
+  font-size: 8px;
+}
+
+.api-settings-status i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: #666f77;
+}
+
+.api-settings-card.connected .api-settings-status i {
+  background: #39dc98;
+  box-shadow: 0 0 10px rgba(57,220,152,.5);
+}
+
+.api-settings-card.error .api-settings-status i {
+  background: #e65a55;
+}
+
+.api-settings-status small {
+  margin-left: auto;
+  color: #555e66;
+  white-space: nowrap;
+}
+
 .persona-grid {
   padding: 14px;
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: 8px;
   overflow-y: auto;
-  max-height: 60vh;
+  max-height: none;
 }
 
 .persona-grid article {
@@ -1399,6 +1570,21 @@ kbd {
   .raise-main { grid-template-columns: minmax(80px, 1fr) 130px; }
   .action-dock { padding: 7px; min-height: 78px; }
   .table-footer { margin-top: -58px; padding: 0 6px 8px; }
+  .api-settings-copy {
+    grid-template-columns: 1fr;
+  }
+  .api-settings-copy em { display: none; }
+  .api-settings-form {
+    grid-template-columns: 1fr;
+  }
+  .api-settings-status {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .api-settings-status small {
+    width: 100%;
+    margin-left: 13px;
+  }
   .persona-grid { grid-template-columns: 1fr; }
   .log-panel { top: 58px; }
 }

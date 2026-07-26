@@ -48,6 +48,7 @@ export interface Player {
   streetBet: number;
   totalCommitted: number;
   acted: boolean;
+  raiseLocked: boolean;
   lastAction: string;
   result: number;
 }
@@ -121,13 +122,38 @@ export interface BotObservation {
   holeCards: string[];
   communityCards: string[];
   stack: number;
+  startingStack: number;
+  effectiveStack: number;
   pot: number;
   streetBet: number;
   toCall: number;
+  potOddsToCall: number;
+  spr: number;
+  currentBet: number;
+  minRaise: number;
   minimumRaiseTo: number;
+  maximumRaiseTo: number;
   legalActions: ActionKind[];
   publicActions: string[];
   playersRemaining: number;
+  opponentsAbleToAct: number;
+  raiseCountThisStreet: number;
+  blinds: {
+    smallBlind: number;
+    bigBlind: number;
+  };
+  publicPlayers: Array<{
+    name: string;
+    position: string;
+    stack: number;
+    startingStack: number;
+    streetBet: number;
+    totalCommitted: number;
+    folded: boolean;
+    allIn: boolean;
+    acted: boolean;
+    lastAction: string;
+  }>;
 }
 
 export const SMALL_BLIND = 1;
@@ -324,6 +350,7 @@ function freshPlayers(previous?: Player[]): Player[] {
       streetBet: 0,
       totalCommitted: 0,
       acted: false,
+      raiseLocked: false,
       lastAction: "",
       result: 0,
     };
@@ -406,8 +433,12 @@ export function legalActions(state: GameState, player: Player): ActionKind[] {
   const result: ActionKind[] = [];
   if (toCall > 0) result.push("fold", "call");
   else result.push("check");
-  if (player.stack > toCall) result.push("raise");
-  if (player.stack > 0) result.push("allin");
+  const opponentCanRespond = state.players.some(
+    (other) => other.id !== player.id && !other.folded && !other.allIn,
+  );
+  const canAggress =
+    opponentCanRespond && !Boolean(player.raiseLocked) && player.stack > toCall;
+  if (canAggress) result.push("raise", "allin");
   return result;
 }
 
@@ -447,6 +478,7 @@ function collectStreet(state: GameState): void {
   state.players.forEach((player) => {
     player.streetBet = 0;
     player.acted = false;
+    player.raiseLocked = false;
     if (!player.folded) player.lastAction = "";
   });
   state.currentBet = 0;
@@ -532,30 +564,51 @@ function actionLabel(
 }
 
 function awardSingleWinner(state: GameState): void {
-  collectStreet(state);
   const winner = livePlayers(state.players)[0];
+  const highestOpponentStreetBet = Math.max(
+    0,
+    ...state.players
+      .filter((player) => player.id !== winner.id)
+      .map((player) => player.streetBet),
+  );
+  const uncalled = Math.max(0, winner.streetBet - highestOpponentStreetBet);
+  collectStreet(state);
+  const contestedPot = Math.max(0, state.pot - uncalled);
+  const payout = contestedPot + uncalled;
+  state.pot = contestedPot;
   state.potResults = [
     {
       kind: "main",
       label: "Main",
-      amount: state.pot,
+      amount: contestedPot,
       contributors: state.players
         .filter((player) => player.totalCommitted > 0)
         .map((player) => player.id),
       eligible: [winner.id],
       winners: [winner.id],
-      awards: { [winner.id]: state.pot },
+      awards: { [winner.id]: contestedPot },
     },
   ];
-  winner.stack += state.pot;
-  winner.result = state.pot - winner.totalCommitted;
+  if (uncalled > 0) {
+    state.potResults.push({
+      kind: "return",
+      label: "Uncalled return",
+      amount: uncalled,
+      contributors: [winner.id],
+      eligible: [winner.id],
+      winners: [winner.id],
+      awards: { [winner.id]: uncalled },
+    });
+  }
+  winner.stack += payout;
+  winner.result = payout - winner.totalCommitted;
   state.players
     .filter((player) => player.id !== winner.id)
     .forEach((player) => {
       player.result = -player.totalCommitted;
-    });
+  });
   state.winners = [winner.id];
-  state.message = `${winner.name} 赢得 ${amountBB(state.pot)}`;
+  state.message = `${winner.name} 赢得 ${amountBB(contestedPot)}`;
   state.handComplete = true;
   state.street = "showdown";
 }
@@ -990,7 +1043,16 @@ export function applyAction(
       if (raiseSize >= state.minRaise) {
         state.minRaise = raiseSize;
         state.players.forEach((other) => {
-          if (canAct(other)) other.acted = false;
+          if (canAct(other)) {
+            other.acted = false;
+            other.raiseLocked = false;
+          }
+        });
+      } else {
+        state.players.forEach((other) => {
+          if (!canAct(other) || other.id === player.id) return;
+          if (other.acted) other.raiseLocked = true;
+          if (other.streetBet < toAmount) other.acted = false;
         });
       }
       state.currentBet = toAmount;
@@ -1071,6 +1133,23 @@ function randomRaiseTo(state: GameState, player: Player, aggression: number): nu
   return Math.min(maxTo, Math.max(minTo, Math.round(state.currentBet + pot * multiplier)));
 }
 
+function preflopHandClass(cards: Card[]): string {
+  const [a, b] = cards;
+  const high = rankValue(a.rank) >= rankValue(b.rank) ? a : b;
+  const low = high === a ? b : a;
+  if (high.rank === low.rank) return `${high.rank}${low.rank}`;
+  return `${high.rank}${low.rank}${high.suit === low.suit ? "s" : "o"}`;
+}
+
+function raiseCountThisStreet(state: GameState): number {
+  return state.actions.filter(
+    (action) =>
+      action.street === state.street &&
+      (action.kind === "raise" || action.kind === "allin") &&
+      action.toAmount > action.facedBet,
+  ).length;
+}
+
 export function localBotDecision(
   state: GameState,
   player: Player,
@@ -1088,6 +1167,31 @@ export function localBotDecision(
   const adjusted = strength + noise + (persona.looseness - 0.5) * 0.23;
   const canRaise = legal.includes("raise");
   const jamPressure = player.stack <= pot * 1.15 || player.persona.id === "short";
+  const raiseDepth = raiseCountThisStreet(state);
+
+  if (state.street === "preflop" && toCall > 0 && raiseDepth >= 3) {
+    const hand = preflopHandClass(player.hole);
+    const call = legal.includes("call") ? { action: "call" as const } : { action: "fold" as const };
+    if (raiseDepth >= 5) {
+      return hand === "AA" || hand === "KK" ? call : { action: "fold" };
+    }
+    if (raiseDepth >= 4) {
+      return ["AA", "KK", "AKs"].includes(hand) ? call : { action: "fold" };
+    }
+    if (hand === "AA" || hand === "KK") {
+      if (canRaise && player.stack <= pot * 1.35) return { action: "allin" };
+      return call;
+    }
+    if (["QQ", "AKs", "AKo"].includes(hand)) return call;
+    if (
+      ["boss", "maniac"].includes(persona.id) &&
+      ["JJ", "AQs"].includes(hand) &&
+      callPressure <= 0.34
+    ) {
+      return call;
+    }
+    return { action: "fold" };
+  }
 
   if (canRaise && jamPressure && adjusted > 0.66 - persona.aggression * 0.12) {
     return { action: "allin" };
@@ -1127,6 +1231,15 @@ export function localBotDecision(
 }
 
 export function botObservation(state: GameState, player: Player): BotObservation {
+  const pot = totalPot(state);
+  const toCall = Math.max(0, state.currentBet - player.streetBet);
+  const opponents = state.players.filter(
+    (other) => other.id !== player.id && !other.folded,
+  );
+  const effectiveStack = Math.min(
+    startingStack(state, player),
+    Math.max(0, ...opponents.map((opponent) => startingStack(state, opponent))),
+  );
   return {
     handNo: state.handNo,
     street: state.street,
@@ -1134,18 +1247,43 @@ export function botObservation(state: GameState, player: Player): BotObservation
     holeCards: player.hole.map(cardCode),
     communityCards: state.community.map(cardCode),
     stack: player.stack,
-    pot: totalPot(state),
+    startingStack: startingStack(state, player),
+    effectiveStack,
+    pot,
     streetBet: player.streetBet,
-    toCall: Math.max(0, state.currentBet - player.streetBet),
+    toCall,
+    potOddsToCall: toCall > 0 ? toCall / (pot + toCall) : 0,
+    spr: pot > 0 ? player.stack / pot : 0,
+    currentBet: state.currentBet,
+    minRaise: state.minRaise,
     minimumRaiseTo: Math.min(
       player.streetBet + player.stack,
       state.currentBet + state.minRaise,
     ),
+    maximumRaiseTo: player.streetBet + player.stack,
     legalActions: legalActions(state, player),
     publicActions: state.actions.map(
       (action) => `${action.street}:${action.position} ${action.label}`,
     ),
     playersRemaining: livePlayers(state.players).length,
+    opponentsAbleToAct: opponents.filter((opponent) => !opponent.allIn).length,
+    raiseCountThisStreet: raiseCountThisStreet(state),
+    blinds: {
+      smallBlind: SMALL_BLIND,
+      bigBlind: BIG_BLIND,
+    },
+    publicPlayers: state.players.map((publicPlayer) => ({
+      name: publicPlayer.name,
+      position: publicPlayer.position,
+      stack: publicPlayer.stack,
+      startingStack: startingStack(state, publicPlayer),
+      streetBet: publicPlayer.streetBet,
+      totalCommitted: publicPlayer.totalCommitted,
+      folded: publicPlayer.folded,
+      allIn: publicPlayer.allIn,
+      acted: publicPlayer.acted,
+      lastAction: publicPlayer.lastAction,
+    })),
   };
 }
 
@@ -1185,7 +1323,8 @@ export function compactHandLog(state: GameState): string {
         .filter((action) => action.street === street)
         .map((action) => playerActionName(action, hero.id))
         .join(" ");
-      if (!actions && street !== "preflop") return "";
+      const boardCards = communityByStreet[street] ?? "";
+      if (!actions && street !== "preflop" && !boardCards) return "";
       const board = street === "preflop" ? "" : ` ${communityByStreet[street] ?? ""}`;
       return `${streetLabels[street]}${board} ${actions}`.trim();
     })

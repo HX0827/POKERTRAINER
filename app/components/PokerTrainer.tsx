@@ -33,6 +33,15 @@ interface StoredHand {
   createdAt: string;
 }
 
+interface BrowserApiSettings {
+  apiKey: string;
+  model: "deepseek-v4-pro" | "deepseek-v4-flash";
+}
+
+type ApiConnectionState = "idle" | "testing" | "connected" | "error";
+
+const API_STORAGE_KEY = "mist-table-deepseek-settings-v1";
+
 function signedBb(value: number): string {
   const normalized = Math.abs(value) < 0.05 ? 0 : value;
   return `${normalized >= 0 ? "+" : ""}${normalized.toFixed(1)}BB`;
@@ -174,6 +183,14 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const [buyInDraft, setBuyInDraft] = useState(100);
   const [hands, setHands] = useState<StoredHand[]>([]);
   const [apiReady, setApiReady] = useState(false);
+  const [apiSettings, setApiSettings] = useState<BrowserApiSettings | null>(null);
+  const [apiDraft, setApiDraft] = useState<BrowserApiSettings>({
+    apiKey: "",
+    model: "deepseek-v4-pro",
+  });
+  const [apiConnection, setApiConnection] = useState<ApiConnectionState>("idle");
+  const [apiMessage, setApiMessage] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
   const [thinking, setThinking] = useState("");
   const [copied, setCopied] = useState(false);
   const [clearStatus, setClearStatus] = useState<"idle" | "clearing" | "cleared" | "error">("idle");
@@ -192,15 +209,83 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const maxRaiseTo = actor?.isHero ? actor.streetBet + actor.stack : 0;
 
   useEffect(() => {
+    let hasBrowserSettings = false;
+    try {
+      const saved = window.localStorage.getItem(API_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved) as BrowserApiSettings;
+        if (
+          parsed.apiKey &&
+          ["deepseek-v4-pro", "deepseek-v4-flash"].includes(parsed.model)
+        ) {
+          hasBrowserSettings = true;
+          setApiSettings(parsed);
+          setApiDraft(parsed);
+          setApiConnection("connected");
+          setApiMessage("已读取本机保存的 DeepSeek 设置");
+          setApiReady(true);
+        }
+      }
+    } catch {
+      window.localStorage.removeItem(API_STORAGE_KEY);
+    }
     fetch("/api/ai/status")
       .then((response) => response.json())
-      .then((data) => setApiReady(Boolean(data.configured)))
-      .catch(() => setApiReady(false));
+      .then((data) => setApiReady(hasBrowserSettings || Boolean(data.configured)))
+      .catch(() => setApiReady(hasBrowserSettings));
     fetch("/api/hands")
       .then((response) => response.json())
       .then((data) => setHands(Array.isArray(data.hands) ? data.hands : []))
       .catch(() => setHands([]));
   }, []);
+
+  const testAndSaveApi = async () => {
+    const candidate = {
+      apiKey: apiDraft.apiKey.trim(),
+      model: apiDraft.model,
+    };
+    if (!candidate.apiKey) {
+      setApiConnection("error");
+      setApiMessage("请先输入 DeepSeek API Key");
+      return;
+    }
+    setApiConnection("testing");
+    setApiMessage("正在验证 Key 与模型…");
+    try {
+      const response = await fetch("/api/ai/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(candidate),
+      });
+      const data = (await response.json()) as { configured?: boolean; error?: string };
+      if (!response.ok || !data.configured) {
+        throw new Error(data.error || "连接失败");
+      }
+      window.localStorage.setItem(API_STORAGE_KEY, JSON.stringify(candidate));
+      setApiSettings(candidate);
+      setApiReady(true);
+      setApiConnection("connected");
+      setApiMessage("连接成功，下一次 AI 行动起生效");
+    } catch (error) {
+      setApiConnection("error");
+      setApiMessage(error instanceof Error ? error.message : "连接失败，请检查 API Key");
+    }
+  };
+
+  const removeApiSettings = async () => {
+    window.localStorage.removeItem(API_STORAGE_KEY);
+    setApiSettings(null);
+    setApiDraft({ apiKey: "", model: "deepseek-v4-pro" });
+    setApiConnection("idle");
+    setApiMessage("已移除本机保存的 API Key");
+    try {
+      const response = await fetch("/api/ai/status");
+      const data = await response.json();
+      setApiReady(Boolean(data.configured));
+    } catch {
+      setApiReady(false);
+    }
+  };
 
   useEffect(() => {
     if (!actor?.isHero || game.handComplete) return;
@@ -275,6 +360,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 prompt: actor.persona.prompt,
               },
               observation: botObservation(game, actor),
+              api: apiSettings ?? undefined,
             }),
           });
           if (response.ok) {
@@ -298,7 +384,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
       });
     }, delay);
     return () => window.clearTimeout(timer);
-  }, [actor, apiReady, game]);
+  }, [actor, apiReady, apiSettings, game]);
 
   const act = (action: ActionKind, amount?: number) => {
     decisionToken.current += 1;
@@ -379,7 +465,14 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
         <nav>
           <span className="status-chip fog"><i /> 迷雾开启</span>
           <span className={`status-chip ${apiReady ? "online" : "local"}`}>
-            <i /> {apiReady ? "统一 API 已连接" : "本地人格引擎"}
+            <i />{" "}
+            {apiSettings
+              ? apiSettings.model === "deepseek-v4-pro"
+                ? "DeepSeek V4 Pro"
+                : "DeepSeek V4 Flash"
+              : apiReady
+                ? "统一 API 已连接"
+                : "本地人格引擎"}
           </span>
           <button className="icon-button" onClick={() => setShowPlayers(true)} aria-label="AI 玩家设置">
             ⚙
@@ -625,6 +718,82 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
               </div>
               <button onClick={() => setShowPlayers(false)} aria-label="关闭">×</button>
             </header>
+            <section className={`api-settings-card ${apiConnection}`}>
+              <div className="api-settings-copy">
+                <span>DEEPSEEK API</span>
+                <div>
+                  <h3>让 7 位 AI 使用同一个模型</h3>
+                  <p>每个座位只会收到自己的底牌和桌面公开信息，Key 只保存在当前浏览器。</p>
+                </div>
+                <em>api.deepseek.com</em>
+              </div>
+              <div className="api-settings-form">
+                <label>
+                  <span>模型</span>
+                  <select
+                    value={apiDraft.model}
+                    onChange={(event) =>
+                      setApiDraft((current) => ({
+                        ...current,
+                        model: event.target.value as BrowserApiSettings["model"],
+                      }))
+                    }
+                  >
+                    <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
+                    <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
+                  </select>
+                </label>
+                <label className="api-key-field">
+                  <span>API Key</span>
+                  <div>
+                    <input
+                      type={showApiKey ? "text" : "password"}
+                      value={apiDraft.apiKey}
+                      onChange={(event) =>
+                        setApiDraft((current) => ({
+                          ...current,
+                          apiKey: event.target.value,
+                        }))
+                      }
+                      placeholder="sk-..."
+                      autoComplete="off"
+                      spellCheck={false}
+                      aria-label="DeepSeek API Key"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowApiKey((value) => !value)}
+                      aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"}
+                    >
+                      {showApiKey ? "隐藏" : "显示"}
+                    </button>
+                  </div>
+                </label>
+                <button
+                  type="button"
+                  className="api-save-button"
+                  onClick={testAndSaveApi}
+                  disabled={apiConnection === "testing"}
+                >
+                  {apiConnection === "testing" ? "正在连接…" : "测试并保存"}
+                </button>
+                {apiSettings && (
+                  <button type="button" className="api-remove-button" onClick={removeApiSettings}>
+                    移除
+                  </button>
+                )}
+              </div>
+              <div className="api-settings-status" role="status">
+                <i />
+                <span>
+                  {apiMessage ||
+                    (apiReady
+                      ? "API 已连接，下一次 AI 行动会自动使用。"
+                      : "未填写时继续使用本地人格引擎。")}
+                </span>
+                <small>不会写入牌谱、训练记录或云端数据库</small>
+              </div>
+            </section>
             <div className="persona-grid">
               {game.players.filter((player) => !player.isHero).map((player) => (
                 <article key={player.id} style={{ "--player-color": player.persona.color } as React.CSSProperties}>
@@ -645,7 +814,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
             <footer>
               <span className={`connection-light ${apiReady ? "connected" : ""}`} />
               {apiReady
-                ? "统一 API 已连接：每次行动发送独立、脱敏后的玩家视角。"
+                ? `${apiSettings ? "DeepSeek 已连接" : "统一 API 已连接"}：每次行动发送独立、脱敏后的玩家视角。`
                 : "当前使用本地人格引擎；配置统一 API 后会自动切换。"}
             </footer>
           </section>

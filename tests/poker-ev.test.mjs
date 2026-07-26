@@ -3,9 +3,12 @@ import test from "node:test";
 
 import {
   applyAction,
+  botObservation,
   calculateHeroAllInEv,
   compactHandLog,
   heroEvSummary,
+  legalActions,
+  localBotDecision,
   startHand,
 } from "../app/lib/poker.ts";
 
@@ -179,7 +182,7 @@ test("preflop all-in EV is explicitly labeled as a 25,000-run simulation", () =>
   assert.ok(ev.standardError > 0);
 });
 
-test("multiway all-in history records starting stacks, commitments, cards, and each pot", () => {
+test("multiway all-in history records starting stacks, commitments, cards, and each contested pot", () => {
   const heroCards = ["As", "Ad"];
   const middleCards = ["Ks", "Kd"];
   const deepCards = ["Qs", "Qd"];
@@ -261,7 +264,7 @@ test("multiway all-in history records starting stacks, commitments, cards, and e
     heroAllInEv: null,
   };
 
-  const finished = applyAction(state, "allin");
+  const finished = applyAction(state, "check");
   assert.equal(finished.handComplete, true);
   assert.equal(finished.pot, 1204);
   assert.deepEqual(
@@ -269,7 +272,6 @@ test("multiway all-in history records starting stacks, commitments, cards, and e
     [
       ["main", 600, ["hero"]],
       ["side", 604, ["middle"]],
-      ["return", 202, ["deep"]],
     ],
   );
 
@@ -278,13 +280,13 @@ test("multiway all-in history records starting stacks, commitments, cards, and e
   assert.match(log, /Eff\(hero\) CO 100BB; UTG\+1 100BB/);
   assert.match(
     log,
-    /Committed BTN\(hero\) 100BB \[all-in\]; CO 251BB \[all-in\]; UTG\+1 352BB \[all-in\]/,
+    /Committed BTN\(hero\) 100BB \[all-in\]; CO 251BB \[all-in\]; UTG\+1 251BB/,
   );
   assert.match(log, /Cards BTN\(hero\)=AsAd; CO=KsKd; UTG\+1=QsQd/);
   assert.match(log, /Main 300BB -> BTN\(hero\):登邓灯 300BB/);
   assert.match(log, /Side 1 302BB -> CO:Volcano 302BB/);
-  assert.match(log, /Uncalled return 101BB -> UTG\+1:老陈 101BB/);
-  assert.match(log, /UTG\+1 bet all-in 101BB/);
+  assert.match(log, /UTG\+1 check/);
+  assert.doesNotMatch(log, /Uncalled return/);
 });
 
 test("a preflop shove records both the raise number and that the player is all-in", () => {
@@ -459,4 +461,147 @@ test("folded contributions do not create fake side pots", () => {
     finished.potResults.map((pot) => [pot.kind, pot.amount, pot.eligible]),
     [["main", 23, ["short", "caller"]]],
   );
+});
+
+test("a lone player cannot bet into opponents who are already all-in", () => {
+  const state = startHand();
+  const hero = state.players.find((player) => player.id === "hero");
+  state.players = state.players.map((player) => ({
+    ...player,
+    folded: !["hero", "gto"].includes(player.id),
+    allIn: player.id === "gto",
+    streetBet: 0,
+  }));
+  state.currentBet = 0;
+  assert.deepEqual(legalActions(state, state.players.find((player) => player.id === hero.id)), [
+    "check",
+  ]);
+});
+
+test("a short all-in does not reopen raising for a player who already acted", () => {
+  const state = startHand();
+  state.players = state.players.slice(0, 3).map((player, index) => ({
+    ...player,
+    folded: false,
+    allIn: false,
+    stack: index === 1 ? 50 : 300,
+    streetBet: 100,
+    totalCommitted: 100,
+    acted: index === 0,
+    raiseLocked: false,
+  }));
+  state.actingIndex = 1;
+  state.currentBet = 100;
+  state.minRaise = 100;
+
+  const next = applyAction(state, "allin");
+  const priorCaller = next.players[0];
+  assert.equal(priorCaller.raiseLocked, true);
+  assert.deepEqual(legalActions(next, priorCaller), ["fold", "call"]);
+});
+
+test("fold award separates the winner's uncalled excess from the contested pot", () => {
+  const state = startHand();
+  state.players = state.players.slice(0, 2).map((player, index) => ({
+    ...player,
+    folded: false,
+    allIn: false,
+    stack: index === 0 ? 100 : 80,
+    streetBet: index === 0 ? 100 : 20,
+    totalCommitted: index === 0 ? 100 : 20,
+    acted: index === 0,
+    raiseLocked: false,
+  }));
+  state.pot = 40;
+  state.currentBet = 100;
+  state.minRaise = 80;
+  state.actingIndex = 1;
+
+  const finished = applyAction(state, "fold");
+  assert.equal(finished.pot, 80);
+  assert.deepEqual(
+    finished.potResults.map((pot) => [pot.kind, pot.amount]),
+    [
+      ["main", 80],
+      ["return", 80],
+    ],
+  );
+  assert.equal(finished.players[0].result, 60);
+});
+
+test("all-in runout streets remain in the compact hand history without actions", () => {
+  const state = startHand();
+  state.community = ["2c", "3d", "4h", "5s", "6c"].map(card);
+  state.actions = [];
+  state.players = state.players.map((player) => ({
+    ...player,
+    folded: player.id !== "hero",
+  }));
+  state.handComplete = true;
+  state.street = "showdown";
+  state.winners = ["hero"];
+  state.revealed = ["hero"];
+  state.potResults = [];
+
+  const log = compactHandLog(state);
+  assert.match(log, /F 2c3d4h/);
+  assert.match(log, /T 5s/);
+  assert.match(log, /R 6c/);
+});
+
+test("bot observation includes public stack context without leaking opponent cards", () => {
+  const state = startHand();
+  state.actions = [
+    {
+      street: "preflop",
+      playerId: "boss",
+      position: "CO",
+      name: "钱老板",
+      kind: "raise",
+      amount: 6,
+      toAmount: 6,
+      facedBet: 2,
+      allInAfterAction: false,
+      potBefore: 3,
+      label: "open to 3BB",
+    },
+  ];
+  const player = state.players.find((candidate) => candidate.id === "gto");
+  const observation = botObservation(state, player);
+  assert.equal(observation.raiseCountThisStreet, 1);
+  assert.equal(observation.blinds.bigBlind, 2);
+  assert.equal(observation.publicPlayers.length, 8);
+  assert.ok(observation.publicPlayers.every((publicPlayer) => !("hole" in publicPlayer)));
+  assert.ok(observation.publicPlayers.every((publicPlayer) => "startingStack" in publicPlayer));
+});
+
+test("local personality engine folds KJs when facing a four-bet", () => {
+  const state = startHand();
+  const playerIndex = state.players.findIndex((player) => player.id === "boss");
+  state.players = state.players.map((player, index) => ({
+    ...player,
+    folded: ![0, playerIndex].includes(index),
+  }));
+  state.players[playerIndex].hole = [card("Ks"), card("Js")];
+  state.players[playerIndex].streetBet = 12;
+  state.players[playerIndex].stack = 488;
+  state.players[playerIndex].acted = false;
+  state.actingIndex = playerIndex;
+  state.currentBet = 48;
+  state.minRaise = 24;
+  state.actions = [6, 18, 48].map((toAmount, index) => ({
+    street: "preflop",
+    playerId: `raiser-${index}`,
+    position: ["CO", "BTN", "SB"][index],
+    name: `Raiser ${index}`,
+    kind: "raise",
+    amount: toAmount,
+    toAmount,
+    facedBet: index === 0 ? 2 : [6, 18][index - 1],
+    allInAfterAction: false,
+    potBefore: 3,
+    label: ["open to 3BB", "3bet to 9BB", "4bet to 24BB"][index],
+  }));
+
+  assert.deepEqual(localBotDecision(state, state.players[playerIndex]), { action: "fold" });
 });
