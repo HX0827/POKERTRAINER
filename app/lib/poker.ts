@@ -60,8 +60,20 @@ export interface ActionRecord {
   kind: ActionKind;
   amount: number;
   toAmount: number;
+  facedBet: number;
+  allInAfterAction: boolean;
   potBefore: number;
   label: string;
+}
+
+export interface PotResult {
+  kind: "main" | "side" | "return";
+  label: string;
+  amount: number;
+  contributors: string[];
+  eligible: string[];
+  winners: string[];
+  awards: Record<string, number>;
 }
 
 export interface AllInEvRecord {
@@ -96,6 +108,8 @@ export interface GameState {
   handComplete: boolean;
   revealed: string[];
   winners: string[];
+  startingStacks: Record<string, number>;
+  potResults: PotResult[];
   heroStartStack: number;
   heroAllInEv: AllInEvRecord | null;
 }
@@ -344,6 +358,9 @@ export function startHand(previous?: GameState): GameState {
   const deck = makeDeck();
   const hero = players.find((player) => player.isHero);
   const heroStartStack = hero?.stack ?? PERSONAS[0].buyInBB * BIG_BLIND;
+  const startingStacks = Object.fromEntries(
+    players.map((player) => [player.id, player.stack]),
+  );
 
   for (let round = 0; round < 2; round += 1) {
     for (let step = 1; step <= 8; step += 1) {
@@ -376,6 +393,8 @@ export function startHand(previous?: GameState): GameState {
     handComplete: false,
     revealed: [],
     winners: [],
+    startingStacks,
+    potResults: [],
     heroStartStack,
     heroAllInEv: null,
   };
@@ -452,6 +471,14 @@ function cloneState(state: GameState): GameState {
     actions: state.actions.map((action) => ({ ...action })),
     revealed: [...state.revealed],
     winners: [...state.winners],
+    startingStacks: { ...(state.startingStacks ?? {}) },
+    potResults: (state.potResults ?? []).map((pot) => ({
+      ...pot,
+      contributors: [...pot.contributors],
+      eligible: [...pot.eligible],
+      winners: [...pot.winners],
+      awards: { ...pot.awards },
+    })),
     heroAllInEv: state.heroAllInEv ? { ...state.heroAllInEv } : null,
   };
 }
@@ -461,31 +488,65 @@ function actionLabel(
   player: Player,
   kind: ActionKind,
   amount: number,
-  previousBet: number,
+  previousCurrentBet: number,
 ): string {
+  const priorRaises = state.actions.filter(
+    (action) =>
+      action.street === state.street &&
+      action.toAmount > action.facedBet &&
+      (action.kind === "raise" || action.kind === "allin"),
+  ).length;
+  const preflopRaiseVerb =
+    priorRaises === 0 ? "open" : priorRaises === 1 ? "3bet" : `${priorRaises + 2}bet`;
   if (kind === "fold") return "fold";
   if (kind === "check") return "check";
   if (kind === "call") {
-    if (state.street === "preflop" && state.actions.every((action) => action.kind !== "raise")) {
+    if (player.allIn) {
+      return `call all-in ${amountBB(amount)} to ${amountBB(player.streetBet)}`;
+    }
+    if (
+      state.street === "preflop" &&
+      state.actions.every((action) => action.toAmount <= action.facedBet)
+    ) {
       return "limp";
     }
-    return `call ${amountBB(amount)}`;
+    return `call ${amountBB(amount)} to ${amountBB(player.streetBet)}`;
   }
-  if (kind === "allin") return `all-in ${amountBB(player.streetBet)}`;
-  const priorRaises = state.actions.filter(
-    (action) => action.street === state.street && action.kind === "raise",
-  ).length;
+  if (kind === "allin" && player.streetBet <= previousCurrentBet) {
+    return `call all-in ${amountBB(amount)} to ${amountBB(player.streetBet)}`;
+  }
+  if (kind === "allin" || player.allIn) {
+    if (state.street === "preflop") {
+      return `${preflopRaiseVerb} all-in to ${amountBB(player.streetBet)}`;
+    }
+    return previousCurrentBet === 0
+      ? `bet all-in ${amountBB(player.streetBet)}`
+      : `raise all-in to ${amountBB(player.streetBet)}`;
+  }
   if (state.street === "preflop") {
-    const verb = priorRaises === 0 ? "open" : priorRaises === 1 ? "3bet" : `${priorRaises + 2}bet`;
-    return `${verb} ${amountBB(player.streetBet)}`;
+    return `${preflopRaiseVerb} to ${amountBB(player.streetBet)}`;
   }
-  const raiseAmount = player.streetBet - previousBet;
-  return `raise ${amountBB(raiseAmount)}`;
+  return previousCurrentBet === 0
+    ? `bet ${amountBB(player.streetBet)}`
+    : `raise to ${amountBB(player.streetBet)}`;
 }
 
 function awardSingleWinner(state: GameState): void {
   collectStreet(state);
   const winner = livePlayers(state.players)[0];
+  state.potResults = [
+    {
+      kind: "main",
+      label: "Main",
+      amount: state.pot,
+      contributors: state.players
+        .filter((player) => player.totalCommitted > 0)
+        .map((player) => player.id),
+      eligible: [winner.id],
+      winners: [winner.id],
+      awards: { [winner.id]: state.pot },
+    },
+  ];
   winner.stack += state.pot;
   winner.result = state.pot - winner.totalCommitted;
   state.players
@@ -757,10 +818,12 @@ function showdown(state: GameState): void {
   const scores = new Map(ranked.map((entry) => [entry.player.id, entry.score]));
   const payouts = new Map<string, number>();
   const winnerIds = new Set<string>();
+  const potResults: PotResult[] = [];
   const levels = [...new Set(state.players.map((player) => player.totalCommitted).filter((value) => value > 0))].sort(
     (a, b) => a - b,
   );
   let previousLevel = 0;
+  let sidePotNumber = 0;
 
   levels.forEach((level) => {
     const contributors = state.players.filter((player) => player.totalCommitted >= level);
@@ -768,6 +831,21 @@ function showdown(state: GameState): void {
     previousLevel = level;
     const eligible = contenders.filter((player) => player.totalCommitted >= level);
     if (sidePot <= 0 || eligible.length === 0) return;
+    if (contributors.length === 1 && eligible.length === 1) {
+      const player = eligible[0];
+      player.stack += sidePot;
+      payouts.set(player.id, (payouts.get(player.id) ?? 0) + sidePot);
+      potResults.push({
+        kind: "return",
+        label: "Uncalled return",
+        amount: sidePot,
+        contributors: [player.id],
+        eligible: [player.id],
+        winners: [player.id],
+        awards: { [player.id]: sidePot },
+      });
+      return;
+    }
     let top = scores.get(eligible[0].id) as Score;
     eligible.slice(1).forEach((player) => {
       const score = scores.get(player.id) as Score;
@@ -778,14 +856,50 @@ function showdown(state: GameState): void {
     );
     const share = Math.floor(sidePot / sideWinners.length);
     let remainder = sidePot - share * sideWinners.length;
+    const awards: Record<string, number> = {};
     sideWinners.forEach((player) => {
       const award = share + (remainder > 0 ? 1 : 0);
       if (remainder > 0) remainder -= 1;
       player.stack += award;
       payouts.set(player.id, (payouts.get(player.id) ?? 0) + award);
       winnerIds.add(player.id);
+      awards[player.id] = award;
     });
+    const contributorIds = contributors.map((player) => player.id);
+    const eligibleIds = eligible.map((player) => player.id);
+    const winnerIdList = sideWinners.map((player) => player.id);
+    const previousPot = potResults.at(-1);
+    const sameEligibility =
+      previousPot?.kind !== "return" &&
+      previousPot?.eligible.length === eligibleIds.length &&
+      previousPot.eligible.every((id, index) => id === eligibleIds[index]);
+    if (previousPot && sameEligibility) {
+      previousPot.amount += sidePot;
+      previousPot.contributors = [
+        ...new Set([...previousPot.contributors, ...contributorIds]),
+      ];
+      winnerIdList.forEach((playerId) => {
+        previousPot.awards[playerId] =
+          (previousPot.awards[playerId] ?? 0) + (awards[playerId] ?? 0);
+      });
+    } else {
+      const kind = potResults.some((pot) => pot.kind === "main") ? "side" : "main";
+      if (kind === "side") sidePotNumber += 1;
+      potResults.push({
+        kind,
+        label: kind === "main" ? "Main" : `Side ${sidePotNumber}`,
+        amount: sidePot,
+        contributors: contributorIds,
+        eligible: eligibleIds,
+        winners: winnerIdList,
+        awards,
+      });
+    }
   });
+  state.potResults = potResults;
+  state.pot = potResults
+    .filter((pot) => pot.kind !== "return")
+    .reduce((sum, pot) => sum + pot.amount, 0);
   state.players.forEach((player) => {
     player.result = (payouts.get(player.id) ?? 0) - player.totalCommitted;
   });
@@ -848,7 +962,7 @@ export function applyAction(
   if (!legalActions(state, player).includes(kind)) return current;
 
   const potBefore = totalPot(state);
-  const previousBet = player.streetBet;
+  const previousCurrentBet = state.currentBet;
   let amount = 0;
   let toAmount = player.streetBet;
 
@@ -884,7 +998,7 @@ export function applyAction(
     player.acted = true;
   }
 
-  const label = actionLabel(state, player, kind, amount, previousBet);
+  const label = actionLabel(state, player, kind, amount, previousCurrentBet);
   player.lastAction = label;
   state.actions.push({
     street: state.street,
@@ -894,6 +1008,8 @@ export function applyAction(
     kind,
     amount,
     toAmount,
+    facedBet: previousCurrentBet,
+    allInAfterAction: player.allIn,
     potBefore,
     label,
   });
@@ -1038,6 +1154,16 @@ function playerActionName(action: ActionRecord, heroId: string): string {
   return `${who} ${action.label}`;
 }
 
+function playerLogName(state: GameState, playerId: string): string {
+  const player = state.players.find((candidate) => candidate.id === playerId);
+  if (!player) return playerId;
+  return `${player.position}${player.isHero ? "(hero)" : ""}:${player.name}`;
+}
+
+function startingStack(state: GameState, player: Player): number {
+  return state.startingStacks?.[player.id] ?? player.stack - player.result;
+}
+
 export function compactHandLog(state: GameState): string {
   const hero = state.players.find((player) => player.isHero) as Player;
   const streets: Street[] = ["preflop", "flop", "turn", "river"];
@@ -1076,7 +1202,65 @@ export function compactHandLog(state: GameState): string {
   const evText = ev
     ? ` | All-in EV ${ev.expectedResult >= 0 ? "+" : ""}${amountBB(ev.expectedResult)} | Luck ${ev.luck >= 0 ? "+" : ""}${amountBB(ev.luck)} ${ev.method === "exact" ? "[exact]" : `[MC ${ev.trials}]`}`
     : "";
-  return `H#${String(state.handNo).padStart(4, "0")} | 1/2 | ${hero.position}(hero) ${heroCards} | ${actionText} | ${winnerText} wins | Hero ${resultText}${evText}`;
+  const stackText = state.players
+    .map(
+      (player) =>
+        `${player.position}${player.isHero ? "(hero)" : ""} ${amountBB(startingStack(state, player))}`,
+    )
+    .join("; ");
+  const relevantOpponents = state.players.filter(
+    (player) =>
+      !player.isHero &&
+      (player.totalCommitted > BIG_BLIND ||
+        state.revealed.includes(player.id) ||
+        state.winners.includes(player.id)),
+  );
+  const effectiveText = relevantOpponents
+    .map(
+      (player) =>
+        `${player.position} ${amountBB(
+          Math.min(startingStack(state, hero), startingStack(state, player)),
+        )}`,
+    )
+    .join("; ");
+  const committedText = state.players
+    .filter((player) => player.totalCommitted > 0)
+    .map(
+      (player) =>
+        `${player.position}${player.isHero ? "(hero)" : ""} ${amountBB(player.totalCommitted)}${player.allIn ? " [all-in]" : ""}`,
+    )
+    .join("; ");
+  const cardPlayers = state.players.filter(
+    (player) =>
+      player.isHero ||
+      state.revealed.includes(player.id) ||
+      player.totalCommitted > BIG_BLIND * 2,
+  );
+  const cardsText = cardPlayers
+    .map((player) => {
+      const visible = player.isHero || state.revealed.includes(player.id);
+      const cards = visible ? player.hole.map(cardCode).join("") : "??";
+      return `${player.position}${player.isHero ? "(hero)" : ""}=${cards}`;
+    })
+    .join("; ");
+  const potsText = (state.potResults ?? [])
+    .map((pot) => {
+      const awards = Object.entries(pot.awards)
+        .map(([playerId, award]) => `${playerLogName(state, playerId)} ${amountBB(award)}`)
+        .join("/");
+      return `${pot.label} ${amountBB(pot.amount)} -> ${awards}`;
+    })
+    .join("; ");
+  const auditText = [
+    `Stacks ${stackText}`,
+    effectiveText ? `Eff(hero) ${effectiveText}` : "",
+    `Committed ${committedText}`,
+    `Cards ${cardsText}`,
+    potsText ? `Pots ${potsText}` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
+  return `H#${String(state.handNo).padStart(4, "0")} | 1/2 | ${hero.position}(hero) ${heroCards} | ${auditText} | ${actionText} | ${winnerText} wins | Hero ${resultText}${evText}`;
 }
 
 export function markdownLog(lines: string[]): string {
