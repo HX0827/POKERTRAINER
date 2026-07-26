@@ -64,6 +64,22 @@ export interface ActionRecord {
   label: string;
 }
 
+export interface AllInEvRecord {
+  street: Exclude<Street, "showdown">;
+  expectedResult: number;
+  expectedPayout: number;
+  heroCommitted: number;
+  pot: number;
+  method: "exact" | "monte-carlo";
+  trials: number;
+  standardError: number;
+}
+
+export interface HeroEvSummary extends AllInEvRecord {
+  actualResult: number;
+  luck: number;
+}
+
 export interface GameState {
   handNo: number;
   dealerIndex: number;
@@ -81,6 +97,7 @@ export interface GameState {
   revealed: string[];
   winners: string[];
   heroStartStack: number;
+  heroAllInEv: AllInEvRecord | null;
 }
 
 export interface BotObservation {
@@ -279,8 +296,7 @@ function freshPlayers(previous?: Player[]): Player[] {
   return PERSONAS.map((persona, index) => {
     const old = previous?.find((player) => player.id === persona.id);
     const targetStack = persona.buyInBB * BIG_BLIND;
-    const carried =
-      old && old.stack >= 20 * BIG_BLIND ? old.stack : Math.max(old?.stack ?? 0, targetStack);
+    const carried = old && old.stack > 0 ? old.stack : targetStack;
     return {
       id: persona.id,
       name: names[index],
@@ -361,6 +377,7 @@ export function startHand(previous?: GameState): GameState {
     revealed: [],
     winners: [],
     heroStartStack,
+    heroAllInEv: null,
   };
 }
 
@@ -435,6 +452,7 @@ function cloneState(state: GameState): GameState {
     actions: state.actions.map((action) => ({ ...action })),
     revealed: [...state.revealed],
     winners: [...state.winners],
+    heroAllInEv: state.heroAllInEv ? { ...state.heroAllInEv } : null,
   };
 }
 
@@ -567,6 +585,168 @@ export function handName(cards: Card[]): string {
   return SCORE_NAMES[bestScore(cards)[0]];
 }
 
+function combinationCount(total: number, count: number): number {
+  const chosen = Math.min(count, total - count);
+  let result = 1;
+  for (let index = 1; index <= chosen; index += 1) {
+    result = (result * (total - chosen + index)) / index;
+  }
+  return Math.round(result);
+}
+
+function visitCombinations<T>(
+  items: T[],
+  count: number,
+  visit: (selection: T[]) => void,
+  start = 0,
+  selection: T[] = [],
+): void {
+  if (selection.length === count) {
+    visit([...selection]);
+    return;
+  }
+  const remaining = count - selection.length;
+  for (let index = start; index <= items.length - remaining; index += 1) {
+    selection.push(items[index]);
+    visitCombinations(items, count, visit, index + 1, selection);
+    selection.pop();
+  }
+}
+
+function seededRandom(seedValue: number): () => number {
+  let seed = seedValue >>> 0;
+  return () => {
+    seed = (seed + 0x6d2b79f5) >>> 0;
+    let value = seed;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function stateSeed(state: GameState): number {
+  const text = [
+    state.handNo,
+    ...state.community.map(cardCode),
+    ...state.players.flatMap((player) => player.hole.map(cardCode)),
+  ].join("|");
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function heroPayoutForBoard(state: GameState, board: Card[]): number {
+  const hero = state.players.find((player) => player.isHero);
+  if (!hero || hero.folded) return 0;
+  const contenders = livePlayers(state.players);
+  const scores = new Map(
+    contenders.map((player) => [player.id, bestScore([...player.hole, ...board])]),
+  );
+  const levels = [
+    ...new Set(
+      state.players.map((player) => player.totalCommitted).filter((value) => value > 0),
+    ),
+  ].sort((a, b) => a - b);
+  let previousLevel = 0;
+  let heroPayout = 0;
+
+  levels.forEach((level) => {
+    const contributors = state.players.filter((player) => player.totalCommitted >= level);
+    const sidePot = (level - previousLevel) * contributors.length;
+    previousLevel = level;
+    const eligible = contenders.filter((player) => player.totalCommitted >= level);
+    if (sidePot <= 0 || eligible.length === 0) return;
+    let top = scores.get(eligible[0].id) as Score;
+    eligible.slice(1).forEach((player) => {
+      const score = scores.get(player.id) as Score;
+      if (compareScore(score, top) > 0) top = score;
+    });
+    const sideWinners = eligible.filter(
+      (player) => compareScore(scores.get(player.id) as Score, top) === 0,
+    );
+    if (sideWinners.some((player) => player.id === hero.id)) {
+      heroPayout += sidePot / sideWinners.length;
+    }
+  });
+
+  return heroPayout;
+}
+
+export function calculateHeroAllInEv(state: GameState): AllInEvRecord | null {
+  const hero = state.players.find((player) => player.isHero);
+  const contenders = livePlayers(state.players);
+  const missingBoardCards = 5 - state.community.length;
+  if (
+    !hero ||
+    hero.folded ||
+    contenders.length < 2 ||
+    missingBoardCards <= 0 ||
+    state.deck.length < missingBoardCards
+  ) {
+    return null;
+  }
+
+  const possibleRunouts = combinationCount(state.deck.length, missingBoardCards);
+  const exact = possibleRunouts <= 50_000;
+  const trialLimit = 25_000;
+  let trials = 0;
+  let payoutTotal = 0;
+  let payoutSquaredTotal = 0;
+  const scoreRunout = (runout: Card[]) => {
+    const payout = heroPayoutForBoard(state, [...state.community, ...runout]);
+    payoutTotal += payout;
+    payoutSquaredTotal += payout * payout;
+    trials += 1;
+  };
+
+  if (exact) {
+    visitCombinations(state.deck, missingBoardCards, scoreRunout);
+  } else {
+    const random = seededRandom(stateSeed(state));
+    for (let trial = 0; trial < trialLimit; trial += 1) {
+      const pool = [...state.deck];
+      const runout: Card[] = [];
+      for (let cardIndex = 0; cardIndex < missingBoardCards; cardIndex += 1) {
+        const chosenIndex =
+          cardIndex + Math.floor(random() * (pool.length - cardIndex));
+        [pool[cardIndex], pool[chosenIndex]] = [pool[chosenIndex], pool[cardIndex]];
+        runout.push(pool[cardIndex]);
+      }
+      scoreRunout(runout);
+    }
+  }
+
+  const expectedPayout = payoutTotal / trials;
+  const payoutVariance = Math.max(
+    0,
+    payoutSquaredTotal / trials - expectedPayout * expectedPayout,
+  );
+  return {
+    street: state.street as Exclude<Street, "showdown">,
+    expectedResult: expectedPayout - hero.totalCommitted,
+    expectedPayout,
+    heroCommitted: hero.totalCommitted,
+    pot: totalPot(state),
+    method: exact ? "exact" : "monte-carlo",
+    trials,
+    standardError: exact ? 0 : Math.sqrt(payoutVariance / trials),
+  };
+}
+
+export function heroEvSummary(state: GameState): HeroEvSummary | null {
+  const hero = state.players.find((player) => player.isHero);
+  if (!hero || !state.heroAllInEv || !state.handComplete) return null;
+  const actualResult = hero.stack - state.heroStartStack;
+  return {
+    ...state.heroAllInEv,
+    actualResult,
+    luck: actualResult - state.heroAllInEv.expectedResult,
+  };
+}
+
 function showdown(state: GameState): void {
   collectStreet(state);
   const contenders = livePlayers(state.players);
@@ -632,6 +812,14 @@ function runout(state: GameState): void {
 
 function advanceStreet(state: GameState): void {
   collectStreet(state);
+  const actors = state.players.filter(canAct);
+  if (actors.length <= 1) {
+    if (!state.heroAllInEv && state.community.length < 5) {
+      state.heroAllInEv = calculateHeroAllInEv(state);
+    }
+    runout(state);
+    return;
+  }
   if (state.community.length === 0) {
     state.community.push(...drawStreet(state, 3));
     state.street = "flop";
@@ -643,11 +831,6 @@ function advanceStreet(state: GameState): void {
     state.street = "river";
   } else {
     showdown(state);
-    return;
-  }
-  const actors = state.players.filter(canAct);
-  if (actors.length <= 1) {
-    runout(state);
     return;
   }
   state.actingIndex = firstPostflopActor(state.players, state.dealerIndex);
@@ -889,7 +1072,11 @@ export function compactHandLog(state: GameState): string {
     .join("/");
   const result = hero.stack - state.heroStartStack;
   const resultText = `${result >= 0 ? "+" : ""}${amountBB(result)}`;
-  return `H#${String(state.handNo).padStart(4, "0")} | 1/2 | ${hero.position}(hero) ${heroCards} | ${actionText} | ${winnerText} wins | Hero ${resultText}`;
+  const ev = heroEvSummary(state);
+  const evText = ev
+    ? ` | All-in EV ${ev.expectedResult >= 0 ? "+" : ""}${amountBB(ev.expectedResult)} | Luck ${ev.luck >= 0 ? "+" : ""}${amountBB(ev.luck)} ${ev.method === "exact" ? "[exact]" : `[MC ${ev.trials}]`}`
+    : "";
+  return `H#${String(state.handNo).padStart(4, "0")} | 1/2 | ${hero.position}(hero) ${heroCards} | ${actionText} | ${winnerText} wins | Hero ${resultText}${evText}`;
 }
 
 export function markdownLog(lines: string[]): string {

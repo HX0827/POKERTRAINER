@@ -8,6 +8,9 @@ interface HandInput {
   heroCards: string;
   summary: string;
   resultBb: number;
+  evBb: number | null;
+  luckBb: number | null;
+  evMethod: string | null;
   markdown: string;
 }
 
@@ -21,6 +24,9 @@ async function ensureSchema() {
         hero_cards TEXT NOT NULL,
         summary TEXT NOT NULL,
         result_bb REAL NOT NULL DEFAULT 0,
+        ev_bb REAL,
+        luck_bb REAL,
+        ev_method TEXT,
         markdown TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
@@ -29,13 +35,25 @@ async function ensureSchema() {
       "CREATE INDEX IF NOT EXISTS poker_hands_created_at_idx ON poker_hands(created_at DESC)",
     ),
   ]);
+  const columns = await env.DB.prepare("PRAGMA table_info(poker_hands)").all<{ name: string }>();
+  const columnNames = new Set(columns.results.map((column) => column.name));
+  const additions = [
+    ["ev_bb", "ALTER TABLE poker_hands ADD COLUMN ev_bb REAL"],
+    ["luck_bb", "ALTER TABLE poker_hands ADD COLUMN luck_bb REAL"],
+    ["ev_method", "ALTER TABLE poker_hands ADD COLUMN ev_method TEXT"],
+  ] as const;
+  for (const [name, statement] of additions) {
+    if (!columnNames.has(name)) await env.DB.prepare(statement).run();
+  }
 }
 
 export async function GET() {
   try {
     await ensureSchema();
     const result = await env.DB.prepare(
-      `SELECT id, hand_id AS handId, result_bb AS resultBb, markdown, created_at AS createdAt
+      `SELECT id, hand_id AS handId, result_bb AS resultBb,
+              ev_bb AS evBb, luck_bb AS luckBb, ev_method AS evMethod,
+              markdown, created_at AS createdAt
        FROM poker_hands
        ORDER BY id DESC
        LIMIT 100`,
@@ -55,18 +73,28 @@ export async function POST(request: NextRequest) {
       typeof body.heroCards !== "string" ||
       typeof body.summary !== "string" ||
       typeof body.resultBb !== "number" ||
+      (body.evBb !== undefined && body.evBb !== null && typeof body.evBb !== "number") ||
+      (body.luckBb !== undefined && body.luckBb !== null && typeof body.luckBb !== "number") ||
+      (body.evMethod !== undefined &&
+        body.evMethod !== null &&
+        !["exact", "monte-carlo"].includes(body.evMethod)) ||
       typeof body.markdown !== "string" ||
       body.markdown.length > 8000
     ) {
       return NextResponse.json({ error: "Invalid hand record" }, { status: 400 });
     }
     await env.DB.prepare(
-      `INSERT INTO poker_hands (hand_id, hero_cards, summary, result_bb, markdown)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO poker_hands (
+         hand_id, hero_cards, summary, result_bb, ev_bb, luck_bb, ev_method, markdown
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(hand_id) DO UPDATE SET
          hero_cards = excluded.hero_cards,
          summary = excluded.summary,
          result_bb = excluded.result_bb,
+         ev_bb = excluded.ev_bb,
+         luck_bb = excluded.luck_bb,
+         ev_method = excluded.ev_method,
          markdown = excluded.markdown`,
     )
       .bind(
@@ -74,11 +102,16 @@ export async function POST(request: NextRequest) {
         body.heroCards.slice(0, 16),
         body.summary.slice(0, 240),
         body.resultBb,
+        body.evBb ?? null,
+        body.luckBb ?? null,
+        body.evMethod ?? null,
         body.markdown,
       )
       .run();
     const result = await env.DB.prepare(
-      `SELECT id, hand_id AS handId, result_bb AS resultBb, markdown, created_at AS createdAt
+      `SELECT id, hand_id AS handId, result_bb AS resultBb,
+              ev_bb AS evBb, luck_bb AS luckBb, ev_method AS evMethod,
+              markdown, created_at AS createdAt
        FROM poker_hands WHERE hand_id = ?`,
     )
       .bind(body.handId)

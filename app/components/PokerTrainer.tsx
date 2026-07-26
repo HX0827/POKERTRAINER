@@ -13,6 +13,7 @@ import {
   cardCode,
   cardLabel,
   compactHandLog,
+  heroEvSummary,
   isRed,
   legalActions,
   localBotDecision,
@@ -26,7 +27,15 @@ interface StoredHand {
   handId: string;
   markdown: string;
   resultBb: number;
+  evBb: number | null;
+  luckBb: number | null;
+  evMethod: string | null;
   createdAt: string;
+}
+
+function signedBb(value: number): string {
+  const normalized = Math.abs(value) < 0.05 ? 0 : value;
+  return `${normalized >= 0 ? "+" : ""}${normalized.toFixed(1)}BB`;
 }
 
 function PlayingCard({
@@ -174,6 +183,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
 
   const actor = game.players[game.actingIndex];
   const hero = game.players.find((player) => player.isHero) as Player;
+  const currentEv = heroEvSummary(game);
   const heroLegal = actor?.isHero ? legalActions(game, actor) : [];
   const toCall = actor?.isHero ? Math.max(0, game.currentBet - actor.streetBet) : 0;
   const minRaiseTo = actor?.isHero
@@ -203,11 +213,15 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     const line = compactHandLog(finished);
     const heroPlayer = finished.players.find((player) => player.isHero) as Player;
     const resultBb = (heroPlayer.stack - finished.heroStartStack) / BIG_BLIND;
+    const ev = heroEvSummary(finished);
     const optimistic: StoredHand = {
       id: Date.now(),
       handId: `${sessionId.current}-H${String(finished.handNo).padStart(4, "0")}`,
       markdown: line,
       resultBb,
+      evBb: ev ? ev.expectedResult / BIG_BLIND : null,
+      luckBb: ev ? ev.luck / BIG_BLIND : null,
+      evMethod: ev?.method ?? null,
       createdAt: new Date().toISOString(),
     };
     setHands((current) => [optimistic, ...current.filter((hand) => hand.handId !== optimistic.handId)]);
@@ -220,6 +234,9 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
           heroCards: heroPlayer.hole.map(cardCode).join(""),
           summary: finished.message,
           resultBb,
+          evBb: optimistic.evBb,
+          luckBb: optimistic.luckBb,
+          evMethod: optimistic.evMethod,
           markdown: line,
         }),
       });
@@ -295,7 +312,9 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
       const prepared: GameState = {
         ...current,
         players: current.players.map((player) =>
-          player.isHero ? { ...player, stack: buyInBB * BIG_BLIND } : player,
+          player.isHero && player.stack <= 0
+            ? { ...player, stack: buyInBB * BIG_BLIND }
+            : player,
         ),
       };
       return startHand(prepared);
@@ -423,10 +442,36 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
               {game.handComplete ? (
                 <>
                   <div className="result-copy">
-                    <strong className={hero.stack - game.heroStartStack >= 0 ? "positive" : "negative"}>
-                      {hero.stack - game.heroStartStack >= 0 ? "+" : ""}
-                      {amountBB(hero.stack - game.heroStartStack)}
-                    </strong>
+                    <div className="ev-metric">
+                      <span>实赚</span>
+                      <strong className={hero.stack - game.heroStartStack >= 0 ? "positive" : "negative"}>
+                        {signedBb((hero.stack - game.heroStartStack) / BIG_BLIND)}
+                      </strong>
+                    </div>
+                    <div
+                      className="ev-metric"
+                      title={
+                        currentEv
+                          ? currentEv.method === "exact"
+                            ? `锁定全押时点精确枚举 ${currentEv.trials} 种发牌`
+                            : `锁定全押时点模拟 ${currentEv.trials} 次；95% 误差约 ±${(
+                                (1.96 * currentEv.standardError) /
+                                BIG_BLIND
+                              ).toFixed(1)}BB`
+                          : "本手未在河牌前锁定全押，无法精确分离发牌运气"
+                      }
+                    >
+                      <span>ALL-IN EV <i>{currentEv?.method === "exact" ? "精确" : currentEv ? "模拟" : ""}</i></span>
+                      <strong className={currentEv ? (currentEv.expectedResult >= 0 ? "positive" : "negative") : "muted-result"}>
+                        {currentEv ? signedBb(currentEv.expectedResult / BIG_BLIND) : "—"}
+                      </strong>
+                    </div>
+                    <div className="ev-metric">
+                      <span>运气差</span>
+                      <strong className={currentEv ? (currentEv.luck >= 0 ? "lucky" : "unlucky") : "muted-result"}>
+                        {currentEv ? signedBb(currentEv.luck / BIG_BLIND) : "—"}
+                      </strong>
+                    </div>
                   </div>
                   <button className="primary-action next-hand" onClick={newHand}>
                     下一手 <kbd>N</kbd>
@@ -536,6 +581,14 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                     </span>
                   </div>
                   <p>{hand.markdown}</p>
+                  {typeof hand.evBb === "number" && typeof hand.luckBb === "number" && (
+                    <div className="hand-ev-line">
+                      <span>All-in EV {signedBb(hand.evBb)}</span>
+                      <span className={hand.luckBb >= 0 ? "lucky" : "unlucky"}>
+                        运气 {signedBb(hand.luckBb)}
+                      </span>
+                    </div>
+                  )}
                 </article>
               ))
             )}
@@ -605,8 +658,8 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
             <header>
               <div>
                 <span>TABLE BUY-IN</span>
-                <h2>选择下一手买入</h2>
-                <p>盲注 1/2 · 选择后从下一手开始生效</p>
+                <h2>设置 Hero 再买入</h2>
+                <p>盲注 1/2 · 仅在筹码输光后生效，不会重置下一手筹码</p>
               </div>
               <button onClick={() => setShowBuyIn(false)} aria-label="关闭">×</button>
             </header>
@@ -645,7 +698,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 setShowBuyIn(false);
               }}
             >
-              确认买入 {buyInDraft}BB
+              保存再买入 {buyInDraft}BB
             </button>
           </section>
         </div>
