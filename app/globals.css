@@ -549,17 +549,22 @@ button {
 }
 
 .marker-action {
+  width: max-content;
   max-width: 118px;
   padding: 4px 8px;
-  overflow: hidden;
+  overflow: visible;
   border-radius: 12px;
   color: #e7ebea;
   background: rgba(8, 11, 13, 0.84);
   border: 1px solid rgba(255,255,255,.1);
   box-shadow: 0 5px 15px rgba(0,0,0,.34);
   font: 750 8px var(--font-data);
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  line-height: 1.2;
+  text-align: center;
+  white-space: normal;
+  overflow-wrap: break-word;
+  text-overflow: clip;
+  text-wrap: balance;
   backdrop-filter: blur(8px);
 }
 
