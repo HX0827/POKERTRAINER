@@ -200,13 +200,22 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
 
   const actor = game.players[game.actingIndex];
   const hero = game.players.find((player) => player.isHero) as Player;
-  const currentEv = heroEvSummary(game);
   const heroLegal = actor?.isHero ? legalActions(game, actor) : [];
   const toCall = actor?.isHero ? Math.max(0, game.currentBet - actor.streetBet) : 0;
   const minRaiseTo = actor?.isHero
     ? Math.min(actor.streetBet + actor.stack, game.currentBet + game.minRaise)
     : 0;
   const maxRaiseTo = actor?.isHero ? actor.streetBet + actor.stack : 0;
+  const sessionResultBb = hands.reduce((sum, hand) => sum + hand.resultBb, 0);
+  const sessionEvBb = hands.reduce(
+    (sum, hand) => sum + (typeof hand.evBb === "number" ? hand.evBb : hand.resultBb),
+    0,
+  );
+  const sessionLuckBb = hands.reduce(
+    (sum, hand) => sum + (typeof hand.luckBb === "number" ? hand.luckBb : 0),
+    0,
+  );
+  const allInEvHands = hands.filter((hand) => typeof hand.evBb === "number").length;
 
   useEffect(() => {
     let hasBrowserSettings = false;
@@ -536,33 +545,9 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 <>
                   <div className="result-copy">
                     <div className="ev-metric">
-                      <span>实赚</span>
+                      <span>本手结果</span>
                       <strong className={hero.stack - game.heroStartStack >= 0 ? "positive" : "negative"}>
                         {signedBb((hero.stack - game.heroStartStack) / BIG_BLIND)}
-                      </strong>
-                    </div>
-                    <div
-                      className="ev-metric"
-                      title={
-                        currentEv
-                          ? currentEv.method === "exact"
-                            ? `锁定全押时点精确枚举 ${currentEv.trials} 种发牌`
-                            : `锁定全押时点模拟 ${currentEv.trials} 次；95% 误差约 ±${(
-                                (1.96 * currentEv.standardError) /
-                                BIG_BLIND
-                              ).toFixed(1)}BB`
-                          : "本手未在河牌前锁定全押，无法精确分离发牌运气"
-                      }
-                    >
-                      <span>ALL-IN EV <i>{currentEv?.method === "exact" ? "精确" : currentEv ? "模拟" : ""}</i></span>
-                      <strong className={currentEv ? (currentEv.expectedResult >= 0 ? "positive" : "negative") : "muted-result"}>
-                        {currentEv ? signedBb(currentEv.expectedResult / BIG_BLIND) : "—"}
-                      </strong>
-                    </div>
-                    <div className="ev-metric">
-                      <span>运气差</span>
-                      <strong className={currentEv ? (currentEv.luck >= 0 ? "lucky" : "unlucky") : "muted-result"}>
-                        {currentEv ? signedBb(currentEv.luck / BIG_BLIND) : "—"}
                       </strong>
                     </div>
                   </div>
@@ -650,10 +635,22 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
               <strong>{hands.length}<small> 手</small></strong>
             </div>
             <div>
-              <span>Hero 净结果</span>
-              <strong className={hands.reduce((sum, hand) => sum + hand.resultBb, 0) >= 0 ? "positive" : "negative"}>
-                {hands.reduce((sum, hand) => sum + hand.resultBb, 0) >= 0 ? "+" : ""}
-                {hands.reduce((sum, hand) => sum + hand.resultBb, 0).toFixed(1)}<small> BB</small>
+              <span>实际净结果</span>
+              <strong className={sessionResultBb >= 0 ? "positive" : "negative"}>
+                {signedBb(sessionResultBb)}
+              </strong>
+            </div>
+            <div title="没有在河牌前锁定全下的牌局按实际结果计入，锁定全下的牌局改用其期望结果">
+              <span>ALL-IN EV · 累计</span>
+              <strong className={sessionEvBb >= 0 ? "positive" : "negative"}>
+                {signedBb(sessionEvBb)}
+              </strong>
+              <small>{allInEvHands} 手产生 EV 调整</small>
+            </div>
+            <div title="实际净结果减去累计 All-in EV">
+              <span>运气差 · 累计</span>
+              <strong className={sessionLuckBb >= 0 ? "lucky" : "unlucky"}>
+                {signedBb(sessionLuckBb)}
               </strong>
             </div>
           </div>

@@ -831,7 +831,7 @@ kbd {
 }
 
 .action-dock.complete {
-  width: min(620px, 88%);
+  width: min(430px, 88%);
   min-height: 64px;
   justify-content: space-between;
 }
@@ -840,7 +840,7 @@ kbd {
   flex: 1;
   min-width: 0;
   display: grid;
-  grid-template-columns: repeat(3, minmax(82px, 1fr));
+  grid-template-columns: 1fr;
   align-items: center;
   gap: 8px;
   padding-left: 8px;
