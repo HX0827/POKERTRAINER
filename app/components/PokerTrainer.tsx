@@ -114,13 +114,14 @@ function TableMarker({
   seat: number;
   dealer: boolean;
 }) {
-  if (!dealer && !player.lastAction && player.streetBet <= 0) return null;
+  const showAction = Boolean(player.lastAction && player.lastAction !== "fold");
+  if (!dealer && !showAction && player.streetBet <= 0) return null;
   return (
     <div
       className={`table-marker marker-seat-${seat} ${player.folded ? "marker-folded" : ""}`}
       aria-label={`${player.name} 桌面标记`}
     >
-      {player.lastAction && <div className="marker-action">{player.lastAction}</div>}
+      {showAction && <div className="marker-action">{player.lastAction}</div>}
       <div className="marker-row">
         {dealer && <span className="table-dealer">D</span>}
         {player.streetBet > 0 && (
@@ -337,18 +338,10 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">M</span>
-          <div>
-            <strong>MIST TABLE</strong>
-            <small>AI POKER TRAINING ROOM</small>
+        <div className="topbar-left">
+          <div className="brand" aria-label="Mist Table">
+            <span className="brand-mark">M</span>
           </div>
-        </div>
-        <div className="table-title">
-          <strong>黑雾训练桌 · 8 MAX</strong>
-          <span>NLH CASH&nbsp;&nbsp;1 / 2</span>
-        </div>
-        <nav>
           <button
             className="buyin-button"
             onClick={() => {
@@ -359,6 +352,12 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
             <span>BUY-IN</span>
             <b>{buyInBB}BB</b>
           </button>
+        </div>
+        <div className="table-title">
+          <strong>黑雾训练桌 · 8 MAX</strong>
+          <span>NLH CASH&nbsp;&nbsp;1 / 2</span>
+        </div>
+        <nav>
           <span className="status-chip fog"><i /> 迷雾开启</span>
           <span className={`status-chip ${apiReady ? "online" : "local"}`}>
             <i /> {apiReady ? "统一 API 已连接" : "本地人格引擎"}
@@ -420,22 +419,14 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
           </div>
 
           <div className="table-footer">
-            <div className="hand-meta">
-              <span>H#{String(game.handNo).padStart(4, "0")}</span>
-              <span>BTN {game.players[game.dealerIndex].name}</span>
-              <span>{thinking || (actor?.isHero ? "轮到你行动" : game.message)}</span>
-            </div>
-
             <div className={`action-dock ${game.handComplete ? "complete" : ""}`}>
               {game.handComplete ? (
                 <>
                   <div className="result-copy">
-                    <span>本手结果</span>
                     <strong className={hero.stack - game.heroStartStack >= 0 ? "positive" : "negative"}>
                       {hero.stack - game.heroStartStack >= 0 ? "+" : ""}
                       {amountBB(hero.stack - game.heroStartStack)}
                     </strong>
-                    <small>{compactHandLog(game)}</small>
                   </div>
                   <button className="primary-action next-hand" onClick={newHand}>
                     下一手 <kbd>N</kbd>
