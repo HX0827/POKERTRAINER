@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActionKind,
   BIG_BLIND,
@@ -13,7 +13,6 @@ import {
   cardCode,
   cardLabel,
   compactHandLog,
-  handName,
   isRed,
   legalActions,
   localBotDecision,
@@ -61,14 +60,12 @@ function PlayerSeat({
   player,
   seat,
   active,
-  dealer,
   winner,
   reveal,
 }: {
   player: Player;
   seat: number;
   active: boolean;
-  dealer: boolean;
   winner: boolean;
   reveal: boolean;
 }) {
@@ -96,7 +93,6 @@ function PlayerSeat({
         <div className="player-info">
           <div className="player-name-line">
             <strong>{player.name}</strong>
-            {player.isHero && <span className="hero-tag">HERO</span>}
           </div>
           <span className="persona-name">
             {player.persona.title} · {player.persona.subtitle}
@@ -104,15 +100,36 @@ function PlayerSeat({
           <b className="stack">{player.stack.toLocaleString()} <small>({amountBB(player.stack)})</small></b>
         </div>
         <span className="position-pill">{player.position}</span>
-        {dealer && <span className="dealer-chip">D</span>}
       </div>
-      {player.lastAction && <div className="action-bubble">{player.lastAction}</div>}
-      {player.streetBet > 0 && (
-        <div className="chips">
-          <span className="chip-stack" />
-          <b>{player.streetBet}</b>
-        </div>
-      )}
+    </div>
+  );
+}
+
+function TableMarker({
+  player,
+  seat,
+  dealer,
+}: {
+  player: Player;
+  seat: number;
+  dealer: boolean;
+}) {
+  if (!dealer && !player.lastAction && player.streetBet <= 0) return null;
+  return (
+    <div
+      className={`table-marker marker-seat-${seat} ${player.folded ? "marker-folded" : ""}`}
+      aria-label={`${player.name} 桌面标记`}
+    >
+      {player.lastAction && <div className="marker-action">{player.lastAction}</div>}
+      <div className="marker-row">
+        {dealer && <span className="table-dealer">D</span>}
+        {player.streetBet > 0 && (
+          <span className="table-bet">
+            <i className="chip-stack" />
+            <b>{player.streetBet}</b>
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -142,6 +159,9 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const [raiseTo, setRaiseTo] = useState(6);
   const [showLog, setShowLog] = useState(true);
   const [showPlayers, setShowPlayers] = useState(false);
+  const [showBuyIn, setShowBuyIn] = useState(false);
+  const [buyInBB, setBuyInBB] = useState(100);
+  const [buyInDraft, setBuyInDraft] = useState(100);
   const [hands, setHands] = useState<StoredHand[]>([]);
   const [apiReady, setApiReady] = useState(false);
   const [thinking, setThinking] = useState("");
@@ -269,7 +289,15 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const newHand = () => {
     decisionToken.current += 1;
     setCopied(false);
-    setGame((current) => startHand(current));
+    setGame((current) => {
+      const prepared: GameState = {
+        ...current,
+        players: current.players.map((player) =>
+          player.isHero ? { ...player, stack: buyInBB * BIG_BLIND } : player,
+        ),
+      };
+      return startHand(prepared);
+    });
   };
 
   const copyLogs = async () => {
@@ -289,11 +317,6 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     URL.revokeObjectURL(link.href);
   };
 
-  const boardName = useMemo(() => {
-    if (game.community.length < 3 || hero.folded) return "";
-    return handName([...hero.hole, ...game.community]);
-  }, [game.community, hero.folded, hero.hole]);
-
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -309,6 +332,16 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
           <span>NLH CASH&nbsp;&nbsp;1 / 2</span>
         </div>
         <nav>
+          <button
+            className="buyin-button"
+            onClick={() => {
+              setBuyInDraft(buyInBB);
+              setShowBuyIn(true);
+            }}
+          >
+            <span>BUY-IN</span>
+            <b>{buyInBB}BB</b>
+          </button>
           <span className="status-chip fog"><i /> 迷雾开启</span>
           <span className={`status-chip ${apiReady ? "online" : "local"}`}>
             <i /> {apiReady ? "统一 API 已连接" : "本地人格引擎"}
@@ -345,10 +378,6 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                       ),
                     )}
                   </div>
-                  <div className="street-line">
-                    <span>{game.street === "showdown" ? "本手结束" : game.street.toUpperCase()}</span>
-                    <b>{game.message}</b>
-                  </div>
                 </div>
               </div>
             </div>
@@ -359,9 +388,16 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 player={player}
                 seat={seat}
                 active={!game.handComplete && seat === game.actingIndex}
-                dealer={seat === game.dealerIndex}
                 winner={game.winners.includes(player.id)}
                 reveal={game.revealed.includes(player.id)}
+              />
+            ))}
+            {game.players.map((player, seat) => (
+              <TableMarker
+                key={`marker-${player.id}`}
+                player={player}
+                seat={seat}
+                dealer={seat === game.dealerIndex}
               />
             ))}
           </div>
@@ -389,28 +425,25 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                   </button>
                 </>
               ) : actor?.isHero ? (
-                <>
-                  <div className="hero-readout">
-                    <span>你的牌</span>
-                    <b>{hero.hole.map(cardLabel).join(" ")}</b>
-                    <small>{boardName || `${hero.position} · ${amountBB(hero.stack)} 有效筹码`}</small>
-                  </div>
-                  <div className="decision-actions">
+                <div className="decision-actions">
+                  <div className="basic-actions">
                     {heroLegal.includes("fold") && (
                       <button className="fold-button" onClick={() => act("fold")}>
-                        Fold <kbd>F</kbd>
+                        <span>Fold</span><kbd>F</kbd>
                       </button>
                     )}
                     {heroLegal.includes("check") && (
                       <button className="check-button" onClick={() => act("check")}>
-                        Check <kbd>X</kbd>
+                        <span>Check</span><kbd>X</kbd>
                       </button>
                     )}
                     {heroLegal.includes("call") && (
                       <button className="call-button" onClick={() => act("call")}>
-                        Call <b>{toCall}</b> <kbd>C</kbd>
+                        <span>Call</span><b>{toCall}</b><kbd>C</kbd>
                       </button>
                     )}
+                  </div>
+                  <div className="raise-zone">
                     {heroLegal.includes("raise") && (
                       <div className="raise-control">
                         <div className="raise-presets">
@@ -427,21 +460,23 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                           })}
                           <button onClick={() => setRaiseTo(maxRaiseTo)}>ALL-IN</button>
                         </div>
-                        <input
-                          aria-label="加注到"
-                          type="range"
-                          min={minRaiseTo}
-                          max={Math.max(minRaiseTo, maxRaiseTo)}
-                          value={Math.max(minRaiseTo, Math.min(maxRaiseTo, raiseTo))}
-                          onChange={(event) => setRaiseTo(Number(event.target.value))}
-                        />
-                        <button className="primary-action" onClick={() => act("raise", raiseTo)}>
-                          Raise to <b>{raiseTo}</b> <kbd>R</kbd>
-                        </button>
+                        <div className="raise-main">
+                          <input
+                            aria-label="加注到"
+                            type="range"
+                            min={minRaiseTo}
+                            max={Math.max(minRaiseTo, maxRaiseTo)}
+                            value={Math.max(minRaiseTo, Math.min(maxRaiseTo, raiseTo))}
+                            onChange={(event) => setRaiseTo(Number(event.target.value))}
+                          />
+                          <button className="primary-action" onClick={() => act("raise", raiseTo)}>
+                            <span>Raise to</span><b>{raiseTo}</b><kbd>R</kbd>
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
-                </>
+                </div>
               ) : (
                 <div className="waiting-state">
                   <span className="thinking-dots"><i /><i /><i /></span>
@@ -539,6 +574,58 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 ? "统一 API 已连接：每次行动发送独立、脱敏后的玩家视角。"
                 : "当前使用本地人格引擎；配置统一 API 后会自动切换。"}
             </footer>
+          </section>
+        </div>
+      )}
+
+      {showBuyIn && (
+        <div className="modal-backdrop" onClick={() => setShowBuyIn(false)}>
+          <section className="buyin-modal" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <span>TABLE BUY-IN</span>
+                <h2>选择下一手买入</h2>
+                <p>盲注 1/2 · 选择后从下一手开始生效</p>
+              </div>
+              <button onClick={() => setShowBuyIn(false)} aria-label="关闭">×</button>
+            </header>
+            <div className="buyin-options">
+              {[50, 100, 150, 200, 300].map((value) => (
+                <button
+                  key={value}
+                  className={buyInDraft === value ? "selected" : ""}
+                  onClick={() => setBuyInDraft(value)}
+                >
+                  <b>{value}</b>
+                  <span>BB</span>
+                  <small>{value * BIG_BLIND} 筹码</small>
+                </button>
+              ))}
+            </div>
+            <div className="buyin-slider">
+              <div>
+                <span>自定义买入</span>
+                <strong>{buyInDraft}BB</strong>
+              </div>
+              <input
+                aria-label="买入大盲数量"
+                type="range"
+                min={40}
+                max={300}
+                step={10}
+                value={buyInDraft}
+                onChange={(event) => setBuyInDraft(Number(event.target.value))}
+              />
+            </div>
+            <button
+              className="buyin-confirm"
+              onClick={() => {
+                setBuyInBB(buyInDraft);
+                setShowBuyIn(false);
+              }}
+            >
+              确认买入 {buyInDraft}BB
+            </button>
           </section>
         </div>
       )}
