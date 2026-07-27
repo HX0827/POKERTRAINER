@@ -19,7 +19,9 @@ import {
   legalActions,
   localBotDecision,
   markdownLog,
+  parseSavedGame,
   resolveTier,
+  serializeGame,
   startHand,
   totalPot,
   type TableTier,
@@ -90,6 +92,8 @@ interface DecisionRecord {
    * live would leak the opponent's intent and destroy the training value (§7.3).
    */
   reason?: string | null;
+  /** 这条决策出自深度思考吗?对冲之后快答经常赢,复盘时要能分辨每个决策的成色。 */
+  thought?: boolean;
 }
 
 interface DecisionResponse {
@@ -110,11 +114,18 @@ interface DecisionResponse {
     vetoRule?: string;
     detail?: string;
   } | null;
+  thinking?: boolean;
 }
 
 const API_STORAGE_KEY = "mist-table-deepseek-settings-v1";
 const REVEAL_STORAGE_KEY = "mist-table-reveal-all-v1";
+/** 深度思考开关(只作用于翻后;翻前路由永远走快答)。默认开。 */
+const DEEPTHINK_STORAGE_KEY = "mist-table-deepthink-v1";
 const TIER_STORAGE_KEY = "mist-table-tier-v1";
+/** 整份牌局状态:刷新/重开页面原样接上,打到一半也不例外。重置对局或清空记录时作废。 */
+const GAME_STORAGE_KEY = "mist-table-game-v1";
+/** 上一版只存两手之间的快照,已被整份状态取代;发现就顺手删掉。 */
+const LEGACY_PROGRESS_KEY = "mist-table-progress-v1";
 /**
  * How many finished hands the rolling behavioural window keeps (CONTRACT-V3 §一/§三.4).
  * Long enough for `selfCalibration`'s 8-hand floor to mean something, short enough that a seat
@@ -130,8 +141,8 @@ const DIRECTIVE_LIMITS: Record<"light" | "normal" | "hard", number> = {
   normal: 3,
   hard: 5,
 };
-/** Client-side ceiling; the route budgets ~9s of its own, so this only catches a hung socket. */
-const DECISION_TIMEOUT_MS = 12000;
+/** Client-side ceiling; the route budgets up to ~13.5s (对冲首问 10s + 快答重问 3.5s), so this only catches a hung socket. */
+const DECISION_TIMEOUT_MS = 16000;
 /** Provenance is kept for the current hand plus this many previous hands, then pruned. */
 const KEPT_HAND_HISTORY = 2;
 /** Persona-modal footer tallies at most this many of the most recent AI actions. */
@@ -252,6 +263,9 @@ function buildSourceSuffix(records: DecisionRecord[]): string {
     `LF:${counts["local-fallback"]}${details("local-fallback")}`,
   ];
   if (counts["local-engine"] > 0) parts.push(`LG:${counts["local-engine"]}`);
+  // 深度思考给出的决策数。对冲机制下快答经常赢,这个数字告诉你本手 AI 的"认真程度"。
+  const thoughtful = ordered.filter((record) => record.thought).length;
+  parts.push(`TH:${thoughtful}`);
   return parts.join(" ");
 }
 
@@ -274,7 +288,9 @@ function buildReasonTrail(records: DecisionRecord[], players: Player[]): string[
       const seat = name ? `${record.position} ${name}` : record.position;
       // 只压掉换行和多余空格——模型偶尔会返回带换行的文本，那会把子列表撑散。
       const text = (record.reason as string).replace(/\s+/g, " ").trim();
-      return `${street} ${seat} ${record.finalLabelHint} — ${text}`;
+      // 〔深思〕= 这条决策出自深度思考。没有标记的是快答——复盘时看到嘴瓢
+      // (比如说要从打得过自己的牌上拿价值),先看这里就知道是不是快答惹的祸。
+      return `${street} ${seat} ${record.finalLabelHint} — ${text}${record.thought ? "〔深思〕" : ""}`;
     });
 }
 
@@ -284,12 +300,15 @@ function recentSourceTally(store: Map<number, DecisionRecord[]>): string {
   Array.from(store.keys())
     .sort((left, right) => left - right)
     .forEach((handNo) => flat.push(...orderedRecords(store.get(handNo) ?? [])));
-  const counts = countSources(flat.slice(-TALLY_WINDOW));
+  const window = flat.slice(-TALLY_WINDOW);
+  const counts = countSources(window);
   const tracked =
     counts.ds + counts["ds-retry"] + counts.override + counts["local-fallback"];
   if (tracked === 0) return "";
+  const thoughtful = window.filter((record) => record.thought).length;
   return [
     `DS ${counts.ds}`,
+    thoughtful > 0 ? `深思 ${thoughtful}` : "",
     counts["ds-retry"] > 0 ? `重问 ${counts["ds-retry"]}` : "",
     counts.override > 0 ? `替换 ${counts.override}` : "",
     counts["local-fallback"] > 0 ? `回退 ${counts["local-fallback"]}` : "",
@@ -500,6 +519,8 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const [showLog, setShowLog] = useState(true);
   // Review aid: once a hand is settled, turn every seat face-up. On by default.
   const [revealAllAtEnd, setRevealAllAtEnd] = useState(true);
+  /** 翻后让模型先想再答。读牌更准,但每个翻后决策慢几秒。 */
+  const [deepThink, setDeepThink] = useState(true);
   const [showPlayers, setShowPlayers] = useState(false);
   const [showBuyIn, setShowBuyIn] = useState(false);
   const [buyInBB, setBuyInBB] = useState(100);
@@ -526,6 +547,8 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const decisionToken = useRef(0);
   /** Read inside logFinishedHand, which intentionally keeps an empty dependency list. */
   const revealAllRef = useRef(true);
+  /** Read inside the decision timer; a toggle mid-hand must not restart the acting AI's timer. */
+  const deepThinkRef = useRef(true);
   /** handNo -> provenance of every AI action that actually reached the table (§7.1). */
   const decisionRecords = useRef<Map<number, DecisionRecord[]>>(new Map());
   /**
@@ -639,8 +662,10 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     try {
       const saved = window.localStorage.getItem(REVEAL_STORAGE_KEY);
       if (saved !== null) setRevealAllAtEnd(saved === "1");
+      const savedThink = window.localStorage.getItem(DEEPTHINK_STORAGE_KEY);
+      if (savedThink !== null) setDeepThink(savedThink === "1");
     } catch {
-      // A blocked localStorage just means the default (on) applies for this session.
+      // A blocked localStorage just means the defaults (both on) apply for this session.
     }
   }, []);
 
@@ -648,17 +673,49 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     revealAllRef.current = revealAllAtEnd;
   }, [revealAllAtEnd]);
 
-  // The server renders the default lineup, so a saved tier is applied once on mount. A whole
-  // fresh deal rather than a swap: the tier decides who is seated, and half a hand cannot
-  // change seats.
+  useEffect(() => {
+    deepThinkRef.current = deepThink;
+  }, [deepThink]);
+
+  // 每次牌局状态一变就整份存盘。Defined ABOVE the restore effect on purpose: on mount the
+  // effects run in this order, the guard is still false, and the server-rendered fresh table
+  // is skipped — so the restore below always reads what LAST session wrote, never what this
+  // render just made up.
+  useEffect(() => {
+    if (!tierRestored.current) return;
+    try {
+      window.localStorage.setItem(GAME_STORAGE_KEY, serializeGame(game));
+    } catch {
+      // Blocked storage only costs cross-session continuity, never the live hand.
+    }
+  }, [game]);
+
+  // The server renders a fresh default table, so the saved tier and the saved game are applied
+  // once on mount. A valid save wins outright: the exact state — hole cards, board, pot, whose
+  // turn — continues as if the refresh never happened. The AI think effect keys off the acting
+  // seat and has proper timer cleanup, so a hand restored mid-decision simply resumes thinking.
+  // No save (or a save from another lineup/version, which parseSavedGame rejects): fresh table
+  // on the saved tier, from hand one.
   useEffect(() => {
     if (tierRestored.current) return;
     tierRestored.current = true;
     let saved: TableTier = tier;
+    let savedGame: GameState | null = null;
     try {
       saved = resolveTier(window.localStorage.getItem(TIER_STORAGE_KEY));
+      savedGame = parseSavedGame(window.localStorage.getItem(GAME_STORAGE_KEY));
+      window.localStorage.removeItem(LEGACY_PROGRESS_KEY);
     } catch {
-      return; // Blocked storage: play the default lineup for this session.
+      return; // Blocked storage: play the default lineup, from zero, for this session.
+    }
+    if (savedGame && resolveTier(savedGame.tier) === saved) {
+      decisionToken.current += 1;
+      // A finished hand was already logged by the session that finished it; restoring it must
+      // not log (and store) it a second time.
+      if (savedGame.handComplete) loggedHand.current = savedGame.handNo;
+      setTier(saved);
+      setGame(savedGame);
+      return;
     }
     if (saved === tier) return;
     decisionToken.current += 1;
@@ -697,6 +754,18 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
       const next = !current;
       try {
         window.localStorage.setItem(REVEAL_STORAGE_KEY, next ? "1" : "0");
+      } catch {
+        // Not persisting is acceptable; the toggle still applies to this session.
+      }
+      return next;
+    });
+  }, []);
+
+  const toggleDeepThink = useCallback(() => {
+    setDeepThink((current) => {
+      const next = !current;
+      try {
+        window.localStorage.setItem(DEEPTHINK_STORAGE_KEY, next ? "1" : "0");
       } catch {
         // Not persisting is acceptable; the toggle still applies to this session.
       }
@@ -902,6 +971,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
       let rule: string | undefined;
       let failReason: string | undefined;
       let reason: string | null = null;
+      let thought = false;
 
       if (apiReady) {
         // Read from the ref, never fetched here: the profile must add zero latency to a decision.
@@ -947,6 +1017,13 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
               },
               observation: botObservation(game, actor),
               api: apiSettings ?? undefined,
+              // Ref, not state: a toggle mid-hand applies from the NEXT decision without
+              // restarting the acting AI's think timer. 思考只花在和真人对战的决策上:
+              // 你一弃牌,剩下的 AI 互殴全部降回快答——那些底池的输赢跟训练无关,
+              // 等它们慢慢想纯属浪费你的时间。
+              deepThink:
+                deepThinkRef.current &&
+                !(game.players.find((player) => player.isHero)?.folded ?? true),
               // Omitted entirely while the sample is too small — then the route emits no HERO READ.
               heroProfile:
                 profile.text || directives.length > 0
@@ -972,6 +1049,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
               rule = data.guardrail?.vetoRule;
               // Stored for post-hand review only — never rendered while the hand is live.
               reason = data.model?.reason ?? null;
+              thought = data.thinking === true;
             } else {
               failReason = "illegal-action";
             }
@@ -1043,6 +1121,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
           rule,
           failReason,
           reason,
+          thought,
         });
         return next;
       });
@@ -1089,6 +1168,33 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     URL.revokeObjectURL(link.href);
   };
 
+  /**
+   * 牌桌归零:作废存盘,手数、筹码、按钮位、桌面动态全部回到第一手。只有「重置对局」用它。
+   * 牌谱完全不归它管——「一键清空记录」只删记录、不动牌桌,两个按钮各管各的。
+   */
+  const resetTable = useCallback(() => {
+    // A think timer for a hand that is about to stop existing must not be allowed to land.
+    decisionToken.current += 1;
+    dynamicsRef.current = [];
+    decisionRecords.current.clear();
+    loggedHand.current = 0;
+    setCopied(false);
+    try {
+      window.localStorage.removeItem(GAME_STORAGE_KEY);
+    } catch {
+      // The save effect will overwrite it with the fresh table anyway.
+    }
+    setGame(startHand(undefined, { tier }));
+  }, [tier]);
+
+  const resetGame = () => {
+    const confirmed = window.confirm(
+      "重置对局会把牌桌回到第一手：所有座位按各自买入重新坐下，正在进行的这手作废。已存的牌谱保留。确定吗？",
+    );
+    if (!confirmed) return;
+    resetTable();
+  };
+
   const clearLogs = async () => {
     if (clearStatus === "clearing" || hands.length === 0) return;
     const previousHands = hands;
@@ -1098,6 +1204,8 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
       const response = await fetch("/api/hands", { method: "DELETE" });
       if (!response.ok) throw new Error("Clear failed");
       // The same DELETE drops hero_hand_stats server-side, so the local profile resets with it.
+      // The table itself is deliberately left alone — the live hand, stacks and hand numbering
+      // keep going; only「重置对局」touches those.
       setHeroCounters(EMPTY_HERO_COUNTERS);
       setClearStatus("cleared");
       window.setTimeout(() => setClearStatus("idle"), 1500);
@@ -1403,6 +1511,9 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                     ? "清空失败 · 重试"
                     : "一键清空记录"}
             </button>
+            <button className="clear-logs" onClick={resetGame}>
+              重置对局
+            </button>
           </div>
           <p className="storage-note"><i /> 自动保存到私人训练记录</p>
         </aside>
@@ -1474,6 +1585,16 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                     <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
                   </select>
                 </label>
+                <button
+                  type="button"
+                  className={`reveal-toggle ${deepThink ? "on" : ""}`}
+                  onClick={toggleDeepThink}
+                  aria-pressed={deepThink}
+                  title="只在翻牌后、且你还在这手牌里时，让模型先想清楚再行动（思考有预算上限，通常多等 2~4 秒）。翻牌前和你弃牌后的 AI 互殴永远快答。"
+                >
+                  <i />
+                  <span>深度思考（翻后对战时）</span>
+                </button>
                 <label className="api-key-field">
                   <span>API Key</span>
                   <div>

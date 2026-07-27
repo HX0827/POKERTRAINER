@@ -794,6 +794,162 @@ export function startHand(previous?: GameState, options?: StartHandOptions): Gam
   };
 }
 
+/**
+ * 整份牌局状态的存取——刷新或重开页面后，连手牌、公共牌、底池、轮到谁全部原样接上，
+ * 打到一半的手也不例外。牌谱在 SQLite 里，不归它管；「重置对局」和「一键清空记录」作废它。
+ *
+ * GameState 全是纯数据（没有函数、没有类实例），JSON 直接就是它的序列化格式。
+ * 版本号包一层：状态结构改了就升版本，旧存档宁可作废也不能喂进新引擎。
+ */
+const SAVED_GAME_VERSION = 1;
+
+export function serializeGame(state: GameState): string {
+  return JSON.stringify({ v: SAVED_GAME_VERSION, game: state });
+}
+
+function isCard(value: unknown): value is Card {
+  if (!value || typeof value !== "object") return false;
+  const card = value as Card;
+  return RANKS.includes(card.rank) && SUITS.includes(card.suit);
+}
+
+/** Copies as fresh objects so nothing in the restored state aliases the parsed JSON. */
+function cardArray(value: unknown, max: number): Card[] | null {
+  if (!Array.isArray(value) || value.length > max) return null;
+  const cards: Card[] = [];
+  for (const item of value) {
+    if (!isCard(item)) return null;
+    cards.push({ rank: item.rank, suit: item.suit });
+  }
+  return cards;
+}
+
+const STREET_SET = new Set<Street>(["preflop", "flop", "turn", "river", "showdown"]);
+
+function isMoney(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isSeatIndex(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 0 && (value as number) < 8;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+}
+
+/**
+ * Parse a saved game. Anything malformed returns null — corrupt or tampered storage must cost
+ * the player their carried table at worst, never crash it. The engine-critical fields (cards,
+ * amounts, seat indices) are validated one by one; static seat facts (name, persona, isHero)
+ * are NOT trusted from storage but re-attached from the current code's blueprints, so an app
+ * update that retunes a persona applies to restored tables too. History collections that are
+ * only ever rendered (actions, potResults, rebuys) are shape-filtered rather than deep-checked.
+ */
+export function parseSavedGame(raw: string | null): GameState | null {
+  if (!raw) return null;
+  let envelope: { v?: unknown; game?: unknown };
+  try {
+    envelope = JSON.parse(raw) as { v?: unknown; game?: unknown };
+  } catch {
+    return null;
+  }
+  if (!envelope || envelope.v !== SAVED_GAME_VERSION) return null;
+  const saved = envelope.game as Partial<GameState> | null;
+  if (!saved || typeof saved !== "object") return null;
+
+  if (!Number.isInteger(saved.handNo) || (saved.handNo as number) < 1 || (saved.handNo as number) > 1_000_000)
+    return null;
+  if (!isSeatIndex(saved.dealerIndex) || !isSeatIndex(saved.actingIndex)) return null;
+  if (!STREET_SET.has(saved.street as Street)) return null;
+  if (!isMoney(saved.pot) || !isMoney(saved.currentBet) || !isMoney(saved.minRaise)) return null;
+  if (typeof saved.handComplete !== "boolean") return null;
+
+  const tier = resolveTier(saved.tier);
+  const blueprints = seatBlueprints(tier);
+  if (!Array.isArray(saved.players) || saved.players.length !== blueprints.length) return null;
+  const players: Player[] = [];
+  for (let seat = 0; seat < blueprints.length; seat += 1) {
+    const blueprint = blueprints[seat];
+    const stored = saved.players[seat] as Partial<Player> | null;
+    // Seat order is the deal order; a save whose seats do not line up belongs to another
+    // lineup (or another version of the code) and cannot be continued.
+    if (!stored || typeof stored !== "object" || stored.id !== blueprint.id) return null;
+    if (!isMoney(stored.stack) || !isMoney(stored.streetBet) || !isMoney(stored.totalCommitted))
+      return null;
+    const hole = cardArray(stored.hole, 2);
+    if (hole === null) return null;
+    players.push({
+      id: blueprint.id,
+      name: blueprint.name,
+      isHero: blueprint.isHero,
+      persona: blueprint.persona,
+      stack: stored.stack as number,
+      position: typeof stored.position === "string" ? stored.position : "",
+      hole,
+      folded: Boolean(stored.folded),
+      allIn: Boolean(stored.allIn),
+      streetBet: stored.streetBet as number,
+      totalCommitted: stored.totalCommitted as number,
+      acted: Boolean(stored.acted),
+      raiseLocked: Boolean(stored.raiseLocked),
+      lastAction: typeof stored.lastAction === "string" ? stored.lastAction : "",
+      result: typeof stored.result === "number" && Number.isFinite(stored.result) ? stored.result : 0,
+    });
+  }
+
+  const deck = cardArray(saved.deck, 52);
+  const community = cardArray(saved.community, 5);
+  if (deck === null || community === null) return null;
+
+  const startingStacks: Record<string, number> = {};
+  if (saved.startingStacks && typeof saved.startingStacks === "object") {
+    for (const [id, stack] of Object.entries(saved.startingStacks)) {
+      if (isMoney(stack)) startingStacks[id] = stack;
+    }
+  }
+
+  const hero = players.find((player) => player.isHero);
+  return {
+    handNo: saved.handNo as number,
+    tier,
+    dealerIndex: saved.dealerIndex as number,
+    players,
+    deck,
+    community,
+    street: saved.street as Street,
+    pot: saved.pot as number,
+    currentBet: saved.currentBet as number,
+    minRaise: saved.minRaise as number,
+    actingIndex: saved.actingIndex as number,
+    actions: Array.isArray(saved.actions)
+      ? (saved.actions.filter(
+          (item) => item && typeof item === "object" && typeof (item as ActionRecord).label === "string",
+        ) as ActionRecord[])
+      : [],
+    message: typeof saved.message === "string" ? saved.message : "",
+    handComplete: saved.handComplete,
+    revealed: stringList(saved.revealed),
+    winners: stringList(saved.winners),
+    startingStacks,
+    potResults: Array.isArray(saved.potResults)
+      ? (saved.potResults.filter(
+          (item) => item && typeof item === "object" && isMoney((item as PotResult).amount),
+        ) as PotResult[])
+      : [],
+    heroStartStack: isMoney(saved.heroStartStack) ? saved.heroStartStack : (hero?.stack ?? 0),
+    heroAllInEv:
+      saved.heroAllInEv && typeof saved.heroAllInEv === "object"
+        ? (saved.heroAllInEv as AllInEvRecord)
+        : null,
+    rebuys: Array.isArray(saved.rebuys)
+      ? (saved.rebuys.filter(
+          (item) => item && typeof item === "object" && typeof (item as RebuyRecord).playerId === "string",
+        ) as RebuyRecord[])
+      : [],
+  };
+}
+
 export function legalActions(state: GameState, player: Player): ActionKind[] {
   if (state.handComplete || player.folded || player.allIn) return [];
   const toCall = Math.max(0, state.currentBet - player.streetBet);

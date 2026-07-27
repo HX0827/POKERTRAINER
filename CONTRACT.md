@@ -71,7 +71,7 @@ Success:
   "action": "fold", "raiseTo": null,
   "source": "ds" | "ds-retry" | "override",
   "model": { "handClass": "A8o", "planType": "bluff-catch", "estimatedEquity": 0.4,
-             "reason": "<=140 chars" },
+             "reason": "<=340 chars" },
   "guardrail": { "requiredEquity": 0.387, "engineEquity": 0.223,
                  "assumedRange": "...", "verdict": "pass" | "pass-after-retry" | "overridden",
                  "vetoRule": "POST-CALL-ALLIN", "detail": "..." }

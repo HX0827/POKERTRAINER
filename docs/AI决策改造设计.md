@@ -84,7 +84,7 @@
   "estimatedEquity": 0.31,
   "action": "call",
   "raiseTo": 24,
-  "reason": "不超过140字符的一句话理由"
+  "reason": "不超过340字符的理由,写完整句子,不要写到一半"
 }
 ```
 
@@ -249,7 +249,7 @@ A strategy engine audits your decision. If rejected you get the reason and choos
 OUTPUT: one JSON object only, no prose:
 {"handClass":"A8o","planType":"value|semi-bluff|bluff|bluff-catch|pot-control|give-up",
  "estimatedEquity":0.31,"action":"<one of legalActions>","raiseTo":<number if raise>,
- "reason":"<=140 chars"}
+ "reason":"<=340 chars"}
 
 PERSONA: <persona.prompt>
 ```

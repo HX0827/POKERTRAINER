@@ -46,17 +46,39 @@ interface RequestBody {
    */
   selfCalibration?: string;
   tableRead?: string;
+  /** 齿轮面板里的深度思考开关。只在翻后生效——翻前永远快答。缺省视为开。 */
+  deepThink?: boolean;
 }
 
 const DEEPSEEK_API_BASE = "https://api.deepseek.com";
 const ALLOWED_DEEPSEEK_MODELS = new Set(["deepseek-v4-pro", "deepseek-v4-flash"]);
 
-const MAX_TOKENS = 420;
+// 340 字符的理由 + JSON 其余字段,700 tokens 依然宽裕;上限太紧会把 JSON 本身切坏,
+// 那比理由被截更糟——整个决策都要重问。
+const MAX_TOKENS = 700;
+// 思考要设预算:不设的话模型高兴起来想上几千 token,一个决策十几秒,牌桌等不起。
+// 800 token 足够把"牌面上有没有人打得过我"这类事想明白——要的是不读错牌,不是解 GTO。
+const THINKING_BUDGET_TOKENS = 800;
+// 思考模式下有的接口把思考 token 也计入 max_tokens;思考预算 800 + 答案 700,
+// 给 2000 留足余量,按实际生成计费,不吃亏。
+const MAX_TOKENS_THINKING = 2000;
 const FIRST_TEMPERATURE = 0.45;
 const RETRY_TEMPERATURE = 0.2;
-const FIRST_TIMEOUT_MS = 5000;
-const RETRY_TIMEOUT_MS = 3500;
-const REASON_MAX_CHARS = 140;
+// 思考档首问的天花板。思考请求对冲(见 hedgedThinkingCall):发出去 THINKING_HEDGE_DELAY_MS
+// 还没回来,就并行补一发快答,谁先出内容用谁——DeepSeek 波动的长尾由快答兜住,
+// 回退本地引擎只剩"两条腿全断"一种情况。重问一律快答:那是在纠错格式/非法动作,
+// 不需要再想一遍。快答档沿用原来的 5/3.5 秒,垃圾牌盖牌像真人一样不假思索。
+const FIRST_TIMEOUT_MS = 10000;
+const THINKING_HEDGE_DELAY_MS = 4000;
+const FIRST_TIMEOUT_FAST_MS = 5000;
+const RETRY_TIMEOUT_FAST_MS = 3500;
+// 思考一律用 Flash,不管齿轮里选的什么:思考的用途只是"牌面上谁打得过我"这类
+// 基础验算,Flash 的推理够用,而延迟只有 Pro 思考的一小半——对冲延迟才敢收到 4 秒。
+// 快答/翻前/重问仍然用玩家选的模型,人格和语感不变。
+const THINKING_MODEL = "deepseek-v4-flash";
+// 牌谱里 AI 的理由整句保留才有复盘价值。以前是 140,模型稍一展开就被拦腰切断
+// ("reverse implied od")。340 够写三四句完整的英文;真超了由 clampReason 在词界收尾。
+const REASON_MAX_CHARS = 340;
 const HAND_CLASS_MAX_CHARS = 24;
 const HERO_READ_MAX_CHARS = 400;
 const HERO_POSITION_MAX_CHARS = 12;
@@ -281,10 +303,19 @@ function extractModelFields(value: unknown): ModelFields {
       ? Math.min(1, Math.max(0, candidate.estimatedEquity))
       : null;
   const reason =
-    typeof rawReason === "string" && rawReason.trim()
-      ? rawReason.trim().slice(0, REASON_MAX_CHARS)
-      : null;
+    typeof rawReason === "string" && rawReason.trim() ? clampReason(rawReason.trim()) : null;
   return { handClass, planType, estimatedEquity, reason };
+}
+
+/**
+ * A reason over the limit is cut at the last word boundary and marked with an ellipsis —
+ * never mid-word ("reverse implied od"). 中文没有空格,词界找不到或太靠前就按原样硬切。
+ */
+function clampReason(text: string): string {
+  if (text.length <= REASON_MAX_CHARS) return text;
+  const cut = text.slice(0, REASON_MAX_CHARS);
+  const lastSpace = cut.lastIndexOf(" ");
+  return `${lastSpace > REASON_MAX_CHARS * 0.6 ? cut.slice(0, lastSpace) : cut}…`;
 }
 
 /** The guardrail is allowed to be missing or to throw (parallel implementation) — fail open. */
@@ -366,6 +397,8 @@ function buildFormatRejection(note: string, legalActions: ActionKind[]): string 
 interface ProviderResult {
   content: string | null;
   failure: FailReason | null;
+  /** 这条内容是深度思考给出的吗?对冲之后快答经常赢,牌谱要能看出每个决策的成色。 */
+  thought?: boolean;
 }
 
 function classifyFetchError(error: unknown): FailReason {
@@ -396,8 +429,10 @@ async function callProvider(options: {
       body: JSON.stringify({
         model: options.model,
         temperature: options.temperature,
-        max_tokens: MAX_TOKENS,
-        ...(options.disableThinking ? { thinking: { type: "disabled" } } : {}),
+        max_tokens: options.disableThinking ? MAX_TOKENS : MAX_TOKENS_THINKING,
+        ...(options.disableThinking
+          ? { thinking: { type: "disabled" } }
+          : { thinking: { type: "enabled", budget_tokens: THINKING_BUDGET_TOKENS } }),
         response_format: { type: "json_object" },
         messages: options.messages,
       }),
@@ -414,10 +449,66 @@ async function callProvider(options: {
     if (typeof content !== "string" || !content.trim()) {
       return { content: null, failure: "provider-error" };
     }
-    return { content, failure: null };
+    return { content, failure: null, thought: !options.disableThinking };
   } catch (error) {
     return { content: null, failure: classifyFetchError(error) };
   }
+}
+
+function delay(ms: number): Promise<undefined> {
+  return new Promise((resolve) => setTimeout(() => resolve(undefined), ms));
+}
+
+/** Resolve with the first result that carries content; if none does, with the last failure. */
+function firstWithContent(calls: Array<Promise<ProviderResult>>): Promise<ProviderResult> {
+  return new Promise((resolve) => {
+    let pending = calls.length;
+    let lastFailure: ProviderResult = { content: null, failure: "provider-error" };
+    calls.forEach((call) => {
+      void call.then((result) => {
+        if (result.content) {
+          resolve(result);
+          return;
+        }
+        lastFailure = result;
+        pending -= 1;
+        if (pending === 0) resolve(lastFailure);
+      });
+    });
+  });
+}
+
+/**
+ * 思考档首问的对冲。先发思考请求;THINKING_HEDGE_DELAY_MS 内没回来就并行补一发快答,
+ * 谁先给出内容用谁。宁可要一个"没细想但还在角色里"的 DeepSeek 决策,也不要回退到
+ * 本地引擎——所以只有两条腿全断才算失败。代价是慢局面偶尔为同一个决策付两份 token。
+ * 输掉的思考请求不做取消,FIRST_TIMEOUT_MS 的 AbortSignal 自然收尸。
+ */
+async function hedgedThinkingCall(
+  provider: { apiBase: string; apiKey: string; model: string },
+  messages: ChatMessage[],
+  temperature: number,
+): Promise<ProviderResult> {
+  const thinking = callProvider({
+    ...provider,
+    model: THINKING_MODEL,
+    disableThinking: false,
+    messages,
+    temperature,
+    timeoutMs: FIRST_TIMEOUT_MS,
+  });
+  const early = await Promise.race([thinking, delay(THINKING_HEDGE_DELAY_MS)]);
+  if (early?.content) return early;
+  const fast = callProvider({
+    ...provider,
+    disableThinking: true,
+    messages,
+    temperature,
+    timeoutMs: FIRST_TIMEOUT_FAST_MS,
+  });
+  // 思考那条腿已经明确失败(网络/服务端错):只剩快答一条腿,等它就是。
+  if (early) return fast;
+  return firstWithContent([thinking, fast]);
 }
 
 function parseContent(content: string): unknown {
@@ -460,6 +551,8 @@ function decisionResponse(
   source: DecisionSource,
   model: ModelFields,
   guardrail: GuardrailPayload,
+  /** 最终采纳的那条内容是否出自深度思考。override(本地替换)一律 false。 */
+  thinking: boolean,
 ) {
   return NextResponse.json({
     action: decision.action,
@@ -467,6 +560,7 @@ function decisionResponse(
     source,
     model,
     guardrail,
+    thinking,
   });
 }
 
@@ -540,15 +634,30 @@ export async function POST(request: NextRequest) {
       { role: "system", content: system },
       { role: "user", content: userMessage },
     ];
-    const disableThinking = useBrowserDeepSeek && process.env.AI_THINKING !== "1";
-    const provider = { apiBase, apiKey, model, disableThinking };
+    // 思考只开在翻后。翻前决策真人几乎不假思索(垃圾牌直接扔),而且翻前没有牌面
+    // 可读错——handClassHint 已经替模型认好了手牌;读牌错乱(把 Ax 当价值目标)全发生
+    // 在翻后,那里才值得让模型先想再答。齿轮面板的 deepThink 开关可整体关掉思考,
+    // AI_THINKING=0 是服务端的总闸。
+    const disableThinking =
+      process.env.AI_THINKING === "0" ||
+      body.deepThink === false ||
+      observation.street === "preflop";
+    // 重问一律快答,不管首问走的哪档:重问是在纠错格式/非法动作,不值得再想一遍。
+    const provider = { apiBase, apiKey, model, disableThinking: true };
+    const retryTimeoutMs = RETRY_TIMEOUT_FAST_MS;
 
-    const first = await callProvider({
-      ...provider,
-      messages: baseMessages,
-      temperature: FIRST_TEMPERATURE,
-      timeoutMs: FIRST_TIMEOUT_MS,
-    });
+    const first = disableThinking
+      ? await callProvider({
+          ...provider,
+          messages: baseMessages,
+          temperature: FIRST_TEMPERATURE,
+          timeoutMs: FIRST_TIMEOUT_FAST_MS,
+        })
+      : await hedgedThinkingCall(
+          { apiBase, apiKey, model },
+          baseMessages,
+          FIRST_TEMPERATURE,
+        );
 
     // No usable first answer: only a provider-side HTTP/body failure earns a second attempt.
     if (!first.content) {
@@ -562,7 +671,7 @@ export async function POST(request: NextRequest) {
         ...provider,
         messages: baseMessages,
         temperature: RETRY_TEMPERATURE,
-        timeoutMs: RETRY_TIMEOUT_MS,
+        timeoutMs: retryTimeoutMs,
       });
       if (!repeat.content) {
         const reason: FailReason = repeat.failure ?? "provider-error";
@@ -585,6 +694,7 @@ export async function POST(request: NextRequest) {
             "ds-retry",
             repeatFields,
             buildGuardrail("pass-after-retry", verdict, null, null),
+            Boolean(repeat.thought),
           );
         }
         return decisionResponse(
@@ -592,6 +702,7 @@ export async function POST(request: NextRequest) {
           "override",
           repeatFields,
           buildGuardrail("overridden", verdict, verdict, null),
+          false,
         );
       }
       return decisionResponse(
@@ -599,6 +710,7 @@ export async function POST(request: NextRequest) {
         "override",
         repeatFields,
         buildGuardrail("overridden", null, null, "Provider returned no legal action after two attempts."),
+        false,
       );
     }
 
@@ -617,6 +729,7 @@ export async function POST(request: NextRequest) {
           "ds",
           firstFields,
           buildGuardrail("pass", verdict, null, null),
+          Boolean(first.thought),
         );
       }
       firstVeto = verdict;
@@ -643,7 +756,7 @@ export async function POST(request: NextRequest) {
         { role: "user", content: rejection },
       ],
       temperature: RETRY_TEMPERATURE,
-      timeoutMs: RETRY_TIMEOUT_MS,
+      timeoutMs: retryTimeoutMs,
     });
 
     let retryFields: ModelFields | null = null;
@@ -659,6 +772,7 @@ export async function POST(request: NextRequest) {
             "ds-retry",
             retryFields,
             buildGuardrail("pass-after-retry", firstVeto ?? verdict, firstVeto, formatDetail),
+            Boolean(retry.thought),
           );
         }
       }
@@ -669,6 +783,7 @@ export async function POST(request: NextRequest) {
       "override",
       retryFields ?? firstFields,
       buildGuardrail("overridden", firstVeto, firstVeto, formatDetail),
+      false,
     );
   } catch {
     return failure(502, "AI decision failed", "provider-error");
