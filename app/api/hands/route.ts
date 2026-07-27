@@ -126,6 +126,22 @@ export async function DELETE() {
   try {
     await ensureSchema();
     const result = await env.DB.prepare("DELETE FROM poker_hands").run();
+    // "Clear everything" must also drop the hero profile (CONTRACT-V2 §二). Its table is
+    // owned by /api/hero-profile and may not exist yet, so create-if-missing first and
+    // never let a profile failure block the hand history from being cleared.
+    try {
+      await env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS hero_hand_stats (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          hand_id TEXT NOT NULL UNIQUE,
+          counters TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+      await env.DB.prepare("DELETE FROM hero_hand_stats").run();
+    } catch {
+      // Hero profile storage is optional; the hand log has already been cleared.
+    }
     return NextResponse.json({ ok: true, deleted: result.meta.changes ?? 0 });
   } catch {
     return NextResponse.json({ error: "Could not clear hand records" }, { status: 503 });

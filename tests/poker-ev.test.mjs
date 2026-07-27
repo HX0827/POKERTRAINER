@@ -163,7 +163,7 @@ test("closing a turn all-in captures EV before the river is dealt", () => {
   assert.ok(Math.abs(summary.actualResult - summary.expectedResult - summary.luck) < 1e-9);
 });
 
-test("preflop all-in EV is explicitly labeled as a 25,000-run simulation", () => {
+test("preflop all-in EV enumerates every runout instead of sampling", () => {
   const state = startHand();
   state.pot = 200;
   state.currentBet = 0;
@@ -177,9 +177,36 @@ test("preflop all-in EV is explicitly labeled as a 25,000-run simulation", () =>
 
   const ev = calculateHeroAllInEv(state);
   assert.ok(ev);
-  assert.equal(ev.method, "monte-carlo");
-  assert.equal(ev.trials, 25_000);
-  assert.ok(ev.standardError > 0);
+  /*
+   * 八个座位都发了牌，牌堆固定剩 36 张，翻前要补 5 张 —— C(36,5) = 376,992。这是这个游戏里
+   * 最大的一次穷举，所以每一次全下 EV 都是精确值，不存在抽样误差。原来的阈值是 5 万，翻前
+   * 一律走 25,000 次蒙特卡洛，每手带 ±0.6-1.2BB 的噪声，累计几十手就是十几 BB 的假信号。
+   */
+  assert.equal(ev.method, "exact");
+  assert.equal(ev.trials, 376_992);
+  assert.equal(ev.standardError, 0);
+});
+
+test("a locked-in hero gets an EV snapshot even when opponents still have chips behind", () => {
+  // 英雄翻牌全下，另外两家还有筹码、之后一路过牌到河牌：牌局从没进入「只剩一人能行动」。
+  const state = startHand();
+  state.street = "flop";
+  state.community = ["2c", "7d", "Jh"].map(card);
+  state.players = state.players.map((player, index) => ({
+    ...player,
+    folded: index > 2,
+    allIn: index === 0,
+    stack: index === 0 ? 0 : 400,
+    streetBet: 0,
+    totalCommitted: index <= 2 ? 100 : 0,
+  }));
+  state.players[0] = { ...state.players[0], isHero: true };
+
+  const ev = calculateHeroAllInEv(state);
+  assert.ok(ev, "英雄已经全下、牌还没发完，就必须能拍到快照");
+  assert.equal(ev.street, "flop", "快照要记在钱进池子的那条街");
+  assert.equal(ev.method, "exact");
+  assert.equal(ev.heroCommitted, 100);
 });
 
 test("multiway all-in history records starting stacks, commitments, cards, and each contested pot", () => {
@@ -276,7 +303,8 @@ test("multiway all-in history records starting stacks, commitments, cards, and e
   );
 
   const log = compactHandLog(finished);
-  assert.match(log, /Stacks BTN\(hero\) 100BB; CO 251BB; UTG\+1 352BB/);
+  // Seats carry their persona name so a review never has to guess who sat where.
+  assert.match(log, /Stacks BTN\(hero\):\S+ 100BB; CO:\S+ 251BB; UTG\+1:\S+ 352BB/);
   assert.match(log, /Eff\(hero\) CO 100BB; UTG\+1 100BB/);
   assert.match(
     log,
@@ -604,4 +632,80 @@ test("local personality engine folds KJs when facing a four-bet", () => {
   }));
 
   assert.deepEqual(localBotDecision(state, state.players[playerIndex]), { action: "fold" });
+});
+
+test("the hand log names every seat and can carry the AI reasoning trail", async () => {
+  const { compactHandLog: log, startHand: deal } = await import("../app/lib/poker.ts");
+  const state = deal();
+  const plain = log(state);
+  // Every seat should be identifiable by persona, not just by position (H#0017 review gap).
+  for (const player of state.players) {
+    assert.ok(
+      plain.includes(`${player.position}${player.isHero ? "(hero)" : ""}:${player.name}`),
+      `${player.name} missing from the stacks line`,
+    );
+  }
+  assert.equal(plain.split("\n").length, 1, "没有理由时就该是干干净净的一行");
+
+  /*
+   * 理由不再挤进 H# 那一行。以前是 `| Why a | b | c`，为了不让那一行失控，调用方把每条砍到
+   * 72 字、每手只留 12 条——两刀砍掉的都是已经从模型那里拿到手的内容。现在每条占一行，
+   * 想写多长写多长，而 H# 行本身一个字都没变，`analyze-log.mjs` 照常解析。
+   */
+  const long = "翻牌 K72 彩虹，我在按钮位有范围优势，1/3 池的持续下注可以让所有小对子和 A 高牌做决定，" +
+    "而且这桌的大盲跟得很松，被抓的风险低于我拿到的弃牌率";
+  assert.ok(long.length > 72, "样例理由必须超过旧的 72 字上限，否则这条测试什么也没验证");
+  const reasons = Array.from({ length: 30 }, (_, i) => `F BTN Volcano bet ${i}BB — ${long}`);
+  assert.ok(reasons.length > 12, "条数必须超过旧的 12 条上限");
+
+  const withWhy = log(state, "DS:3 RT:0 OV:0 LF:0", { reasons });
+  const lines = withWhy.split("\n");
+  assert.match(lines[0], /\| Src DS:3 RT:0 OV:0 LF:0$/, "H# 行结尾不变，理由不再挂在后面");
+  assert.equal(lines.length, 1 + reasons.length, "每条理由各占一行，一条都不许丢");
+  reasons.forEach((reason, index) => {
+    assert.equal(lines[index + 1], `  - ${reason}`, `第 ${index + 1} 条理由被改写或截断了`);
+  });
+  // 缩进让牌谱分析脚本自动跳过这些行：它只认顶格的 H#。
+  assert.equal(lines.slice(1).filter((line) => line.startsWith("H#")).length, 0);
+});
+
+test("board texture is classified for the model instead of left to card-code parsing", async () => {
+  const { describeBoard } = await import("../app/lib/poker.ts");
+  const board = (codes) => codes.match(/../g).map(card);
+
+  // The reviewer's example: T-heart 3-spade 6-heart was reported by the model as "T63r".
+  const twoTone = describeBoard(board("Th3s6h"));
+  assert.equal(twoTone.rainbow, false, "two hearts is not a rainbow board");
+  assert.equal(twoTone.twoTone, true);
+  assert.equal(twoTone.maxSuitCount, 2);
+  assert.match(twoTone.summary, /two-tone/);
+
+  assert.equal(describeBoard(board("Th3s6c")).rainbow, true);
+
+  // A turn that completes a flush must say so — it is not "just a scare card".
+  const completed = describeBoard(board("Ah3d8h4h"));
+  assert.equal(completed.flushPossible, true);
+  assert.match(completed.lastCardEffect, /third heart/);
+  assert.match(completed.lastCardEffect, /flush is now possible/);
+
+  // H#0017's board: paired AND three spades by the turn.
+  const h17 = describeBoard(board("JcJsTsQs"));
+  assert.equal(h17.paired, true);
+  assert.equal(h17.flushPossible, true);
+  assert.match(h17.lastCardEffect, /highest card/);
+
+  assert.equal(describeBoard(board("9h8h7h")).monotone, true);
+  assert.equal(describeBoard([card("2c"), card("5d")]), undefined, "no texture before the flop");
+});
+
+test("the observation carries pre-computed texture from the flop onward", async () => {
+  const { startHand: deal, botObservation: observe } = await import("../app/lib/poker.ts");
+  const state = deal();
+  const preflop = observe(state, state.players[state.actingIndex]);
+  assert.equal(preflop.boardTexture, undefined);
+
+  state.community = [card("Th"), card("3s"), card("6h")];
+  const flop = observe(state, state.players[state.actingIndex]);
+  assert.ok(flop.boardTexture);
+  assert.equal(flop.boardTexture.rainbow, false);
 });

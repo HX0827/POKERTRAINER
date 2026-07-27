@@ -1,12 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActionKind,
   BIG_BLIND,
   Card,
   GameState,
   Player,
+  TABLE_TIERS,
   amountBB,
   applyAction,
   botObservation,
@@ -18,9 +19,35 @@ import {
   legalActions,
   localBotDecision,
   markdownLog,
+  resolveTier,
   startHand,
   totalPot,
+  type TableTier,
 } from "../lib/poker";
+import {
+  checkDecision,
+  suggestSafeAction,
+  type BotDecision,
+  type PersonaTraits,
+} from "../lib/strategy";
+import {
+  EMPTY_HERO_COUNTERS,
+  exploitDirectives,
+  heroCountersForHand,
+  mergeHeroCounters,
+  summarizeHeroProfile,
+  type HeroCounters,
+  type HeroProfileSummary,
+} from "../lib/heroProfile";
+import {
+  EMPTY_SEAT_DYNAMICS,
+  EMPTY_TABLE_DYNAMICS,
+  dynamicsForHand,
+  mergeTableDynamics,
+  selfCalibration,
+  tableRead,
+  type TableDynamics,
+} from "../lib/tableDynamics";
 
 interface StoredHand {
   id: number;
@@ -40,7 +67,283 @@ interface BrowserApiSettings {
 
 type ApiConnectionState = "idle" | "testing" | "connected" | "error";
 
+/** Honest provenance of a single AI action — docs/AI决策改造设计.md §7.1. */
+type ActionSource = "ds" | "ds-retry" | "override" | "local-fallback" | "local-engine";
+
+/** Health of the decision pipeline as shown in the top-bar chip (§7.3). */
+type ApiHealth = "connected" | "degraded" | "local";
+
+interface DecisionRecord {
+  actionIndex: number;
+  playerId: string;
+  position: string;
+  street: string;
+  /** The action originally proposed before any guardrail replacement. */
+  kind: string;
+  /** The action that actually reached the table, with size when relevant. */
+  finalLabelHint: string;
+  source: ActionSource;
+  rule?: string;
+  failReason?: string;
+  /**
+   * The model's own explanation. Post-hand inspection only — rendering it while the hand is
+   * live would leak the opponent's intent and destroy the training value (§7.3).
+   */
+  reason?: string | null;
+}
+
+interface DecisionResponse {
+  action?: ActionKind;
+  raiseTo?: number | null;
+  source?: ActionSource;
+  model?: {
+    handClass?: string | null;
+    planType?: string | null;
+    estimatedEquity?: number | null;
+    reason?: string | null;
+  } | null;
+  guardrail?: {
+    requiredEquity?: number | null;
+    engineEquity?: number | null;
+    assumedRange?: string | null;
+    verdict?: string;
+    vetoRule?: string;
+    detail?: string;
+  } | null;
+}
+
 const API_STORAGE_KEY = "mist-table-deepseek-settings-v1";
+const REVEAL_STORAGE_KEY = "mist-table-reveal-all-v1";
+const TIER_STORAGE_KEY = "mist-table-tier-v1";
+/**
+ * How many finished hands the rolling behavioural window keeps (CONTRACT-V3 §一/§三.4).
+ * Long enough for `selfCalibration`'s 8-hand floor to mean something, short enough that a seat
+ * that has genuinely changed gear is not judged on a session-old sample.
+ */
+const DYNAMICS_WINDOW = 25;
+/**
+ * Exploit instructions handed to the AIs, by tier. A casual table is not supposed to be
+ * reading the human at all; a tough one gets everything `exploitDirectives` will produce.
+ */
+const DIRECTIVE_LIMITS: Record<"light" | "normal" | "hard", number> = {
+  light: 1,
+  normal: 3,
+  hard: 5,
+};
+/** Client-side ceiling; the route budgets ~9s of its own, so this only catches a hung socket. */
+const DECISION_TIMEOUT_MS = 12000;
+/** Provenance is kept for the current hand plus this many previous hands, then pruned. */
+const KEPT_HAND_HISTORY = 2;
+/** Persona-modal footer tallies at most this many of the most recent AI actions. */
+const TALLY_WINDOW = 100;
+const MAX_SUFFIX_DETAILS = 2;
+
+/** 翻后：按底池比例。底池够大时这 11 档各不相同，是有意义的尺度。 */
+const POT_PRESETS = [0.2, 0.25, 0.33, 0.5, 0.66, 0.75, 0.8, 1, 1.25, 1.5, 2];
+
+/**
+ * 翻前：按当前注的倍数。
+ *
+ * 翻前底池只有 1.5BB，用底池比例会全部挤在一起——33% 正好等于最小加注，
+ * 50% 和 66% 算出同一个数，75% 和 80% 也是同一个数。真实扑克翻前本来就不按底池算，
+ * 说的是「开到 2.5 倍」「3-bet 到 3 倍」「4-bet 到 2.5 倍」，倍数才是这条街的原生单位。
+ * 覆盖范围：开池 2-4x、3-bet 2.5-4.5x、4-bet 2.2-2.8x。
+ */
+const MULTIPLE_PRESETS = [2, 2.2, 2.5, 2.8, 3, 3.5, 4, 4.5, 5, 6, 8];
+
+/**
+ * 「加注到底池的 X%」的正确算法。
+ *
+ * 面对一个下注时，你要先跟掉 toCall，底池才变成 pot + toCall，再按比例加注——
+ * 所以 raiseTo = currentBet + size × (pot + toCall)。原来的写法漏了 toCall，
+ * 于是在有人下注时，标着「100%」的按钮实际只打出约 75% 底池。
+ * 无人下注时 toCall = 0，退化成「下注 X% 底池」，与直觉一致。
+ */
+function potRelativeRaiseTo(size: number, pot: number, currentBet: number, toCall: number): number {
+  return Math.round(currentBet + size * (pot + toCall));
+}
+
+/**
+ * 翻前的「加注到 N 倍」。倍数是对**当前注**取的，不做任何隐藏调整——
+ * 有 limper 时标准开池是「3 倍再每人加 1BB」，但那要靠滑块自己补：
+ * 按钮上写 3x 就必须正好是 3 倍，否则又变成按钮说谎。
+ */
+function multipleRaiseTo(multiple: number, currentBet: number): number {
+  return Math.round(currentBet * multiple);
+}
+
+const STREET_LETTERS: Record<string, string> = {
+  preflop: "PF",
+  flop: "F",
+  turn: "T",
+  river: "R",
+  showdown: "SD",
+};
+
+function emptySourceCounts(): Record<ActionSource, number> {
+  return { ds: 0, "ds-retry": 0, override: 0, "local-fallback": 0, "local-engine": 0 };
+}
+
+function countSources(records: DecisionRecord[]): Record<ActionSource, number> {
+  const counts = emptySourceCounts();
+  records.forEach((record) => {
+    counts[record.source] += 1;
+  });
+  return counts;
+}
+
+/** `AbortSignal.timeout` rejects with a TimeoutError; a manual abort surfaces as AbortError. */
+function isAbortError(error: unknown): boolean {
+  const name = error && typeof error === "object" ? (error as { name?: unknown }).name : undefined;
+  return name === "TimeoutError" || name === "AbortError";
+}
+
+/**
+ * Idempotent by action index: React may invoke a state updater more than once (StrictMode,
+ * eager evaluation), and the same action must never be counted twice.
+ */
+function pushDecisionRecord(
+  store: Map<number, DecisionRecord[]>,
+  handNo: number,
+  entry: DecisionRecord,
+): void {
+  const existing = store.get(handNo);
+  if (!existing) {
+    store.set(handNo, [entry]);
+    return;
+  }
+  if (existing.some((record) => record.actionIndex === entry.actionIndex)) return;
+  existing.push(entry);
+}
+
+function pruneDecisionRecords(store: Map<number, DecisionRecord[]>, currentHandNo: number): void {
+  const oldestKept = currentHandNo - KEPT_HAND_HISTORY;
+  Array.from(store.keys()).forEach((handNo) => {
+    if (handNo < oldestKept) store.delete(handNo);
+  });
+}
+
+function orderedRecords(records: DecisionRecord[]): DecisionRecord[] {
+  return [...records].sort((left, right) => left.actionIndex - right.actionIndex);
+}
+
+/** `F LJ POST-JAM-EQUITY` (override) or `T BB timeout` (local fallback). */
+function sourceDetail(record: DecisionRecord): string {
+  const street = STREET_LETTERS[record.street] ?? record.street.toUpperCase();
+  const cause = record.source === "override" ? record.rule : record.failReason;
+  return [street, record.position, cause].filter(Boolean).join(" ");
+}
+
+/** `DS:9 RT:1 OV:1(F LJ POST-JAM-EQUITY) LF:0` — appended to the hand log line (§7.2). */
+function buildSourceSuffix(records: DecisionRecord[]): string {
+  if (records.length === 0) return "";
+  const ordered = orderedRecords(records);
+  const counts = countSources(ordered);
+  const details = (source: ActionSource): string => {
+    const matches = ordered.filter((record) => record.source === source);
+    if (matches.length === 0) return "";
+    const shown = matches.slice(0, MAX_SUFFIX_DETAILS).map(sourceDetail).join(", ");
+    return `(${shown}${matches.length > MAX_SUFFIX_DETAILS ? "…" : ""})`;
+  };
+  const parts = [
+    `DS:${counts.ds}`,
+    `RT:${counts["ds-retry"]}`,
+    `OV:${counts.override}${details("override")}`,
+    `LF:${counts["local-fallback"]}${details("local-fallback")}`,
+  ];
+  if (counts["local-engine"] > 0) parts.push(`LG:${counts["local-engine"]}`);
+  return parts.join(" ");
+}
+
+/**
+ * 每个 AI 自己说的行动理由，按行动顺序排好，一条一个元素：
+ * `PF UTG+1 钱老板 open to 3BB — KQs 在中位，先开池施压`
+ *
+ * 这是模型的想法唯一被持久化的地方——牌局一滚出 provenance ref 就没了。以前这里砍了两刀：
+ * 每条截到 72 字（模型本来就只被允许写 140 字，等于一半直接扔掉），每手最多 12 条（400 手
+ * 模拟里每一手的 AI 决策数都远超 12，也就是说每手都在丢）。两刀都是白扔已经拿到手的信息，
+ * 唯一的理由是当时所有理由要挤进 H# 那一行。现在理由各占一行，就没有挤的问题了。
+ */
+function buildReasonTrail(records: DecisionRecord[], players: Player[]): string[] {
+  const nameById = new Map(players.map((player) => [player.id, player.name]));
+  return orderedRecords(records)
+    .filter((record) => typeof record.reason === "string" && record.reason.trim().length > 0)
+    .map((record) => {
+      const street = STREET_LETTERS[record.street] ?? record.street.toUpperCase();
+      const name = nameById.get(record.playerId);
+      const seat = name ? `${record.position} ${name}` : record.position;
+      // 只压掉换行和多余空格——模型偶尔会返回带换行的文本，那会把子列表撑散。
+      const text = (record.reason as string).replace(/\s+/g, " ").trim();
+      return `${street} ${seat} ${record.finalLabelHint} — ${text}`;
+    });
+}
+
+/** `DS 92 · 重问 5 · 替换 2 · 回退 1` over the most recent retained AI actions. */
+function recentSourceTally(store: Map<number, DecisionRecord[]>): string {
+  const flat: DecisionRecord[] = [];
+  Array.from(store.keys())
+    .sort((left, right) => left - right)
+    .forEach((handNo) => flat.push(...orderedRecords(store.get(handNo) ?? [])));
+  const counts = countSources(flat.slice(-TALLY_WINDOW));
+  const tracked =
+    counts.ds + counts["ds-retry"] + counts.override + counts["local-fallback"];
+  if (tracked === 0) return "";
+  return [
+    `DS ${counts.ds}`,
+    counts["ds-retry"] > 0 ? `重问 ${counts["ds-retry"]}` : "",
+    counts.override > 0 ? `替换 ${counts.override}` : "",
+    counts["local-fallback"] > 0 ? `回退 ${counts["local-fallback"]}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+const EMPTY_HERO_SUMMARY: HeroProfileSummary = { handsDealt: 0, text: "", lines: [] };
+
+/**
+ * The stored counters arrive from the network, so every field is re-validated against the shape of
+ * `EMPTY_HERO_COUNTERS` — an unexpected payload degrades to "no profile", never to a crash.
+ */
+function normalizeHeroCounters(value: unknown): HeroCounters {
+  if (!value || typeof value !== "object") return EMPTY_HERO_COUNTERS;
+  const source = value as Record<string, unknown>;
+  const result = { ...EMPTY_HERO_COUNTERS } as unknown as Record<string, number>;
+  Object.keys(result).forEach((key) => {
+    const raw = source[key];
+    if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) result[key] = raw;
+  });
+  return result as unknown as HeroCounters;
+}
+
+/** The profile is an enhancement: any failure inside it collapses to "not enough sample yet". */
+function safeSummarizeHeroProfile(counters: HeroCounters): HeroProfileSummary {
+  try {
+    const summary = summarizeHeroProfile(counters);
+    if (!summary || typeof summary !== "object") return EMPTY_HERO_SUMMARY;
+    return {
+      handsDealt: Number.isFinite(summary.handsDealt) ? summary.handsDealt : 0,
+      text: typeof summary.text === "string" ? summary.text : "",
+      lines: Array.isArray(summary.lines) ? summary.lines : [],
+    };
+  } catch {
+    const handsDealt = counters?.handsDealt;
+    return {
+      ...EMPTY_HERO_SUMMARY,
+      handsDealt: typeof handsDealt === "number" && Number.isFinite(handsDealt) ? handsDealt : 0,
+    };
+  }
+}
+
+/**
+ * Collapse the rolling per-hand dynamics into one set of counters. Kept as a list of hands
+ * rather than a running total so that dropping the 26th-oldest hand is exact rather than a
+ * subtraction that could drift.
+ */
+function mergeWindow(hands: TableDynamics[]): TableDynamics {
+  let total: TableDynamics = EMPTY_TABLE_DYNAMICS;
+  for (const hand of hands) total = mergeTableDynamics(total, hand);
+  return total;
+}
 
 function signedBb(value: number): string {
   const normalized = Math.abs(value) < 0.05 ? 0 : value;
@@ -115,7 +418,10 @@ function PlayerSeat({
           <span className="persona-name">
             {player.persona.title} · {player.persona.subtitle}
           </span>
-          <b className="stack">{player.stack.toLocaleString()} <small>({amountBB(player.stack)})</small></b>
+          {/* BB 是主单位——牌桌、牌谱、AI 的提示词全部按 BB 计价，筹码数退成参考。 */}
+          <b className="stack">
+            {amountBB(player.stack)} <small>({player.stack.toLocaleString()})</small>
+          </b>
         </div>
         <span className="position-pill">{player.position}</span>
       </div>
@@ -127,26 +433,41 @@ function TableMarker({
   player,
   seat,
   dealer,
+  won,
 }: {
   player: Player;
   seat: number;
   dealer: boolean;
+  /** 结算时这个座位从底池里分到的筹码；0 表示没赢。 */
+  won: number;
 }) {
-  const showAction = Boolean(player.lastAction && player.lastAction !== "fold");
-  if (!dealer && !showAction && player.streetBet <= 0) return null;
+  // 赢家的标记整个变成那堆筹码：结算这一刻要一眼看出钱去了谁那里，再挂一句
+  // 「call 10BB」只会让金色筹码旁边多一个抢视线的黑框。动作历史在牌谱里查得到。
+  const showAction = Boolean(player.lastAction && player.lastAction !== "fold") && won <= 0;
+  if (!dealer && !showAction && player.streetBet <= 0 && won <= 0) return null;
   return (
     <div
-      className={`table-marker marker-seat-${seat} ${player.folded ? "marker-folded" : ""}`}
+      className={`table-marker marker-seat-${seat} ${player.folded ? "marker-folded" : ""} ${
+        won > 0 ? "marker-won" : ""
+      }`}
       aria-label={`${player.name} 桌面标记`}
     >
       {showAction && <div className="marker-action">{player.lastAction}</div>}
       <div className="marker-row">
         {dealer && <span className="table-dealer">D</span>}
-        {player.streetBet > 0 && (
-          <span className="table-bet">
-            <i className="chip-stack" />
-            <b>{player.streetBet}</b>
+        {won > 0 ? (
+          <span className="table-bet won-bet">
+            <i className="chip-pile" />
+            <b>+{amountBB(won)}</b>
           </span>
+        ) : (
+          player.streetBet > 0 && (
+            <span className="table-bet">
+              <i className="chip-stack" />
+              {/* 与正上方的动作标签同为 BB：桌上出现「3bet to 9BB」再配一个「18」会直接打架。 */}
+              <b>{amountBB(player.streetBet)}</b>
+            </span>
+          )
         )}
       </div>
     </div>
@@ -177,6 +498,8 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const [game, setGame] = useState<GameState>(initialGame);
   const [raiseTo, setRaiseTo] = useState(6);
   const [showLog, setShowLog] = useState(true);
+  // Review aid: once a hand is settled, turn every seat face-up. On by default.
+  const [revealAllAtEnd, setRevealAllAtEnd] = useState(true);
   const [showPlayers, setShowPlayers] = useState(false);
   const [showBuyIn, setShowBuyIn] = useState(false);
   const [buyInBB, setBuyInBB] = useState(100);
@@ -194,18 +517,63 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const [thinking, setThinking] = useState("");
   const [copied, setCopied] = useState(false);
   const [clearStatus, setClearStatus] = useState<"idle" | "clearing" | "cleared" | "error">("idle");
+  /** Observed public frequencies of the human seat, fed to every AI's system prompt (V2 §三). */
+  const [heroCounters, setHeroCounters] = useState<HeroCounters>(EMPTY_HERO_COUNTERS);
+  /** Which lineup is seated. Mirrors `game.tier`; the two only ever change together. */
+  const [tier, setTier] = useState<TableTier>(() => resolveTier(initialGame.tier));
   const sessionId = useRef(`S${Date.now().toString(36)}`);
   const loggedHand = useRef(0);
   const decisionToken = useRef(0);
+  /** Read inside logFinishedHand, which intentionally keeps an empty dependency list. */
+  const revealAllRef = useRef(true);
+  /** handNo -> provenance of every AI action that actually reached the table (§7.1). */
+  const decisionRecords = useRef<Map<number, DecisionRecord[]>>(new Map());
+  /**
+   * Mirror of the derived profile. The decision effect reads it inside the timer callback so the
+   * profile never enters that effect's dependency array (a profile update mid-hand would otherwise
+   * restart the acting AI's think timer) and never goes stale in its closure.
+   */
+  const heroProfileRef = useRef<HeroProfileSummary>(EMPTY_HERO_SUMMARY);
+  /** Same reasoning as heroProfileRef: read inside the decision timer, never a dependency. */
+  const heroDirectivesRef = useRef<string[]>([]);
+  /**
+   * One entry per finished hand, newest last, at most DYNAMICS_WINDOW of them. A ref rather
+   * than state because nothing on screen depends on it and a re-render mid-hand would restart
+   * the acting AI's think timer. Cleared when the lineup changes: seat ids belong to a table.
+   */
+  const dynamicsRef = useRef<TableDynamics[]>([]);
+  /** Guards the one-shot "apply the tier saved in localStorage" deal. */
+  const tierRestored = useRef(false);
 
+  const tierDefinition = TABLE_TIERS[tier] ?? TABLE_TIERS[resolveTier(undefined)];
   const actor = game.players[game.actingIndex];
   const hero = game.players.find((player) => player.isHero) as Player;
   const heroLegal = actor?.isHero ? legalActions(game, actor) : [];
   const toCall = actor?.isHero ? Math.max(0, game.currentBet - actor.streetBet) : 0;
+  const preflop = game.street === "preflop";
   const minRaiseTo = actor?.isHero
     ? Math.min(actor.streetBet + actor.stack, game.currentBet + game.minRaise)
     : 0;
   const maxRaiseTo = actor?.isHero ? actor.streetBet + actor.stack : 0;
+
+  /**
+   * 结算后每个赢家分到多少筹码。有边池时同一个人会出现在好几条 potResult 里，所以要累加。
+   *
+   * 排掉 kind === "return"：那是无人跟注时退还给自己的部分，本来就没进过底池。算进来的话，
+   * 桌上那堆筹码会比刚才「总底池」显示的数字大，也会跟结算文案里的「赢得 X」对不上。
+   */
+  const potAwards = useMemo(() => {
+    const totals: Record<string, number> = {};
+    if (!game.handComplete) return totals;
+    for (const pot of game.potResults ?? []) {
+      if (pot.kind === "return") continue;
+      for (const [playerId, amount] of Object.entries(pot.awards ?? {})) {
+        if (amount > 0) totals[playerId] = (totals[playerId] ?? 0) + amount;
+      }
+    }
+    return totals;
+  }, [game.handComplete, game.potResults]);
+
   const sessionResultBb = hands.reduce((sum, hand) => sum + hand.resultBb, 0);
   const sessionEvBb = hands.reduce(
     (sum, hand) => sum + (typeof hand.evBb === "number" ? hand.evBb : hand.resultBb),
@@ -216,6 +584,125 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     0,
   );
   const allInEvHands = hands.filter((hand) => typeof hand.evBb === "number").length;
+  /** 只把全下那几手自己的 EV 加起来——上面那个 sessionEvBb 混进了其他牌局的实际结果。 */
+  const sessionAllInEvBb = hands.reduce(
+    (sum, hand) => sum + (typeof hand.evBb === "number" ? hand.evBb : 0),
+    0,
+  );
+  const heroProfile = useMemo(() => safeSummarizeHeroProfile(heroCounters), [heroCounters]);
+  /**
+   * Sample discipline lives in `exploitDirectives` (nothing below 12 observations); the tier
+   * only decides how many of the surviving instructions the table is allowed to act on.
+   */
+  const heroDirectives = useMemo(() => {
+    try {
+      const all = exploitDirectives(heroCounters);
+      return Array.isArray(all)
+        ? all.slice(0, DIRECTIVE_LIMITS[tierDefinition.heroReadStrength] ?? 3)
+        : [];
+    } catch {
+      return [];
+    }
+  }, [heroCounters, tierDefinition.heroReadStrength]);
+
+  useEffect(() => {
+    heroProfileRef.current = heroProfile;
+  }, [heroProfile]);
+
+  useEffect(() => {
+    heroDirectivesRef.current = heroDirectives;
+  }, [heroDirectives]);
+
+  // Chip state is derived from the provenance records themselves: every record is written in the
+  // same guarded path that applies the action, so each write is followed by a re-render and the
+  // derived value can never drift. A new hand starts with no records, i.e. green and zero.
+  const currentHandRecords = decisionRecords.current.get(game.handNo) ?? [];
+  const handFallbackCount = currentHandRecords.filter(
+    (record) => record.source === "local-fallback",
+  ).length;
+  const lastApiSignal = orderedRecords(currentHandRecords)
+    .filter(
+      (record) =>
+        record.source === "ds" ||
+        record.source === "ds-retry" ||
+        record.source === "local-fallback",
+    )
+    .pop();
+  const apiHealth: ApiHealth = !apiReady
+    ? "local"
+    : lastApiSignal?.source === "local-fallback"
+      ? "degraded"
+      : "connected";
+  const sourceTally = recentSourceTally(decisionRecords.current);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(REVEAL_STORAGE_KEY);
+      if (saved !== null) setRevealAllAtEnd(saved === "1");
+    } catch {
+      // A blocked localStorage just means the default (on) applies for this session.
+    }
+  }, []);
+
+  useEffect(() => {
+    revealAllRef.current = revealAllAtEnd;
+  }, [revealAllAtEnd]);
+
+  // The server renders the default lineup, so a saved tier is applied once on mount. A whole
+  // fresh deal rather than a swap: the tier decides who is seated, and half a hand cannot
+  // change seats.
+  useEffect(() => {
+    if (tierRestored.current) return;
+    tierRestored.current = true;
+    let saved: TableTier = tier;
+    try {
+      saved = resolveTier(window.localStorage.getItem(TIER_STORAGE_KEY));
+    } catch {
+      return; // Blocked storage: play the default lineup for this session.
+    }
+    if (saved === tier) return;
+    decisionToken.current += 1;
+    setTier(saved);
+    setGame(startHand(undefined, { tier: saved }));
+  }, [tier]);
+
+  const switchTier = useCallback(
+    (next: TableTier) => {
+      if (next === tier) return;
+      const definition = TABLE_TIERS[next];
+      const confirmed = window.confirm(
+        `切换到「${definition.title}」会重开牌桌：换一套 AI 阵容，所有筹码按各自买入重置。确定吗？`,
+      );
+      if (!confirmed) return;
+      // A think timer for a seat that is about to stop existing must not be allowed to land.
+      decisionToken.current += 1;
+      try {
+        window.localStorage.setItem(TIER_STORAGE_KEY, next);
+      } catch {
+        // Not persisting still leaves the switch in effect for this session.
+      }
+      // Both are scoped to a table: seat ids and the provenance of seats that have left it
+      // would only pollute the new lineup's reads.
+      dynamicsRef.current = [];
+      decisionRecords.current.clear();
+      setCopied(false);
+      setTier(next);
+      setGame((current) => startHand(current, { tier: next, heroBuyInBB: buyInBB }));
+    },
+    [buyInBB, tier],
+  );
+
+  const toggleRevealAll = useCallback(() => {
+    setRevealAllAtEnd((current) => {
+      const next = !current;
+      try {
+        window.localStorage.setItem(REVEAL_STORAGE_KEY, next ? "1" : "0");
+      } catch {
+        // Not persisting is acceptable; the toggle still applies to this session.
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     let hasBrowserSettings = false;
@@ -246,6 +733,14 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
       .then((response) => response.json())
       .then((data) => setHands(Array.isArray(data.hands) ? data.hands : []))
       .catch(() => setHands([]));
+    // The profile is intel for the AIs, not a prerequisite for playing: an outage leaves it empty.
+    fetch("/api/hero-profile")
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => {
+        if (!data || typeof data !== "object") return;
+        setHeroCounters(normalizeHeroCounters((data as { counters?: unknown }).counters));
+      })
+      .catch(() => setHeroCounters(EMPTY_HERO_COUNTERS));
   }, []);
 
   const testAndSaveApi = async () => {
@@ -298,13 +793,29 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
 
   useEffect(() => {
     if (!actor?.isHero || game.handComplete) return;
-    setRaiseTo(Math.max(minRaiseTo, Math.min(maxRaiseTo, Math.round(totalPot(game) * 0.75 + game.currentBet))));
+    const suggested = preflop
+      ? multipleRaiseTo(2.5, game.currentBet)
+      : potRelativeRaiseTo(0.75, totalPot(game), game.currentBet, toCall);
+    setRaiseTo(Math.max(minRaiseTo, Math.min(maxRaiseTo, suggested)));
   }, [actor?.id, actor?.isHero, game.handComplete, game.handNo, game.street, maxRaiseTo, minRaiseTo]);
 
   const logFinishedHand = useCallback(async (finished: GameState) => {
     if (loggedHand.current === finished.handNo) return;
     loggedHand.current = finished.handNo;
-    const line = compactHandLog(finished);
+    // Before any network call, so an outage never costs the table its memory of the hand.
+    try {
+      dynamicsRef.current = [...dynamicsRef.current, dynamicsForHand(finished)].slice(
+        -DYNAMICS_WINDOW,
+      );
+    } catch {
+      // Dynamics are an enhancement; a malformed hand just is not counted.
+    }
+    const records = decisionRecords.current.get(finished.handNo) ?? [];
+    const suffix = buildSourceSuffix(records);
+    const line = compactHandLog(finished, suffix || undefined, {
+      revealAll: revealAllRef.current,
+      reasons: buildReasonTrail(records, finished.players),
+    });
     const heroPlayer = finished.players.find((player) => player.isHero) as Player;
     const resultBb = (heroPlayer.stack - finished.heroStartStack) / BIG_BLIND;
     const ev = heroEvSummary(finished);
@@ -341,6 +852,30 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     } catch {
       // The on-screen copy remains available even if durable storage is temporarily unavailable.
     }
+
+    // Hero profile: its own guarded block, so a hand-log failure above never skips it and a
+    // profile failure here never touches the table. Merged locally only once the row is stored,
+    // which keeps this session's view identical to what a reload would fetch back.
+    try {
+      const counters = heroCountersForHand(finished);
+      const stored = await fetch("/api/hero-profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ handId: optimistic.handId, counters }),
+      });
+      if (!stored.ok) return;
+      // Functional update: `logFinishedHand` is memoized with no deps and must never close over
+      // the current counters.
+      setHeroCounters((current) => {
+        try {
+          return normalizeHeroCounters(mergeHeroCounters(current, counters));
+        } catch {
+          return current;
+        }
+      });
+    } catch {
+      // Profile is an enhancement — a storage outage just means the AIs read one hand less.
+    }
   }, []);
 
   useEffect(() => {
@@ -356,8 +891,47 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     setThinking(`${actor.name} 正在思考`);
     const delay = 420 + Math.round(Math.random() * 620);
     const timer = window.setTimeout(async () => {
-      let decision = localBotDecision(game, actor);
+      const traits: PersonaTraits = {
+        id: actor.persona.id,
+        looseness: actor.persona.looseness,
+        aggression: actor.persona.aggression,
+        bluff: actor.persona.bluff,
+      };
+      let remote: BotDecision | null = null;
+      let source: ActionSource = apiReady ? "local-fallback" : "local-engine";
+      let rule: string | undefined;
+      let failReason: string | undefined;
+      let reason: string | null = null;
+
       if (apiReady) {
+        // Read from the ref, never fetched here: the profile must add zero latency to a decision.
+        const profile = heroProfileRef.current;
+        const directives = heroDirectivesRef.current;
+        const heroSeat = game.players.find((player) => player.isHero)?.position;
+        // The rolling window over the last DYNAMICS_WINDOW hands, turned into the two prompt
+        // lines by tableDynamics. Both return "" below their own sample floors, and the route
+        // omits the whole block when they do.
+        let calibration = "";
+        let read = "";
+        try {
+          const rolling = mergeWindow(dynamicsRef.current);
+          calibration = selfCalibration(
+            rolling[actor.id] ?? EMPTY_SEAT_DYNAMICS,
+            actor.persona.id,
+          );
+          read = tableRead(
+            rolling,
+            game.players.map((player) => ({
+              playerId: player.id,
+              position: player.position,
+              personaId: player.persona.id,
+            })),
+            actor.id,
+          );
+        } catch {
+          calibration = "";
+          read = "";
+        }
         try {
           const response = await fetch("/api/ai/decision", {
             method: "POST",
@@ -367,21 +941,82 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 id: actor.persona.id,
                 title: actor.persona.title,
                 prompt: actor.persona.prompt,
+                looseness: actor.persona.looseness,
+                aggression: actor.persona.aggression,
+                bluff: actor.persona.bluff,
               },
               observation: botObservation(game, actor),
               api: apiSettings ?? undefined,
+              // Omitted entirely while the sample is too small — then the route emits no HERO READ.
+              heroProfile:
+                profile.text || directives.length > 0
+                  ? { text: profile.text, handsDealt: profile.handsDealt, directives }
+                  : undefined,
+              heroPosition: heroSeat,
+              // Empty strings are dropped so an early session's prompt stays byte-identical
+              // to the one the route built before this feature existed.
+              selfCalibration: calibration || undefined,
+              tableRead: read || undefined,
             }),
+            signal: AbortSignal.timeout(DECISION_TIMEOUT_MS),
           });
           if (response.ok) {
-            const data = await response.json();
+            const data = (await response.json()) as DecisionResponse;
             if (data.action && legalActions(game, actor).includes(data.action)) {
-              decision = { action: data.action, raiseTo: data.raiseTo };
+              remote = {
+                action: data.action,
+                raiseTo: typeof data.raiseTo === "number" ? data.raiseTo : undefined,
+              };
+              source =
+                data.source === "ds-retry" || data.source === "override" ? data.source : "ds";
+              rule = data.guardrail?.vetoRule;
+              // Stored for post-hand review only — never rendered while the hand is live.
+              reason = data.model?.reason ?? null;
+            } else {
+              failReason = "illegal-action";
             }
+          } else {
+            const body = (await response.json().catch(() => null)) as {
+              failReason?: string;
+            } | null;
+            failReason = body?.failReason || "network";
           }
-        } catch {
-          // Local personality engine keeps the table playable.
+        } catch (error) {
+          failReason = isAbortError(error) ? "timeout" : "network";
         }
       }
+
+      let applied: BotDecision;
+      let originalKind: ActionKind;
+      if (remote) {
+        applied = remote;
+        originalKind = remote.action;
+      } else {
+        // The local engine gets the same floor as DeepSeek (§8); there is no "ask again" here.
+        const raw = localBotDecision(game, actor);
+        originalKind = raw.action;
+        applied = raw;
+        try {
+          const observation = botObservation(game, actor);
+          const verdict = checkDecision(observation, traits, raw);
+          if (verdict.ok) {
+            applied = { action: raw.action, raiseTo: verdict.clampedRaiseTo ?? raw.raiseTo };
+          } else {
+            applied = suggestSafeAction(observation, traits);
+            rule = verdict.rule;
+          }
+        } catch {
+          // Guardrail unavailable or unhappy with the input: keep the raw local decision.
+          applied = raw;
+          rule = undefined;
+        }
+        if (!legalActions(game, actor).includes(applied.action)) {
+          // A replacement the table would refuse must never stall the hand.
+          applied = raw;
+          rule = undefined;
+        }
+      }
+
       if (token !== decisionToken.current) return;
       setGame((current) => {
         if (
@@ -389,7 +1024,27 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
           current.actingIndex !== game.actingIndex ||
           current.handComplete
         ) return current;
-        return applyAction(current, decision.action, decision.raiseTo);
+        const seat = current.players[current.actingIndex];
+        const actionIndex = current.actions.length;
+        const next = applyAction(current, applied.action, applied.raiseTo);
+        // applyAction returns the same state when it refuses the action; record only real actions.
+        if (next === current) return current;
+        pushDecisionRecord(decisionRecords.current, current.handNo, {
+          actionIndex,
+          playerId: seat.id,
+          position: seat.position,
+          street: current.street,
+          kind: originalKind,
+          finalLabelHint:
+            applied.action === "raise" && typeof applied.raiseTo === "number"
+              ? `raise ${applied.raiseTo}`
+              : applied.action,
+          source,
+          rule,
+          failReason,
+          reason,
+        });
+        return next;
       });
     }, delay);
     return () => window.clearTimeout(timer);
@@ -403,6 +1058,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const newHand = () => {
     decisionToken.current += 1;
     setCopied(false);
+    pruneDecisionRecords(decisionRecords.current, game.handNo + 1);
     setGame((current) => {
       const prepared: GameState = {
         ...current,
@@ -441,6 +1097,8 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     try {
       const response = await fetch("/api/hands", { method: "DELETE" });
       if (!response.ok) throw new Error("Clear failed");
+      // The same DELETE drops hero_hand_stats server-side, so the local profile resets with it.
+      setHeroCounters(EMPTY_HERO_COUNTERS);
       setClearStatus("cleared");
       window.setTimeout(() => setClearStatus("idle"), 1500);
     } catch {
@@ -473,14 +1131,16 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
         </div>
         <nav>
           <span className="status-chip fog"><i /> 迷雾开启</span>
-          <span className={`status-chip ${apiReady ? "online" : "local"}`}>
+          <span className={`status-chip ${apiHealth === "connected" ? "online" : apiHealth}`}>
             <i />{" "}
-            {apiSettings
-              ? apiSettings.model === "deepseek-v4-pro"
-                ? "DeepSeek V4 Pro"
-                : "DeepSeek V4 Flash"
-              : apiReady
-                ? "统一 API 已连接"
+            {apiHealth === "degraded"
+              ? `DeepSeek 波动 · 本手回退 ${handFallbackCount} 次`
+              : apiHealth === "connected"
+                ? apiSettings
+                  ? apiSettings.model === "deepseek-v4-pro"
+                    ? "DeepSeek V4 Pro"
+                    : "DeepSeek V4 Flash"
+                  : "统一 API 已连接"
                 : "本地人格引擎"}
           </span>
           <button className="icon-button" onClick={() => setShowPlayers(true)} aria-label="AI 玩家设置">
@@ -501,10 +1161,12 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
               <div className="felt">
                 <div className="felt-lines" />
                 <div className="table-center">
-                  <div className="pot-label">
+                  {/* 结算后底池已经推给赢家，中间这块要空出来——但保留元素占位，
+                      否则公共牌会往上跳一格。 */}
+                  <div className={`pot-label ${game.handComplete ? "pot-settled" : ""}`}>
                     <span>总底池</span>
-                    <strong>{totalPot(game)}</strong>
-                    <small>{amountBB(totalPot(game))}</small>
+                    <strong>{amountBB(totalPot(game))}</strong>
+                    <small>{totalPot(game).toLocaleString()}</small>
                   </div>
                   <div className="community-cards" aria-label="公共牌">
                     {[0, 1, 2, 3, 4].map((index) =>
@@ -526,7 +1188,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 seat={seat}
                 active={!game.handComplete && seat === game.actingIndex}
                 winner={game.winners.includes(player.id)}
-                reveal={game.revealed.includes(player.id)}
+                reveal={game.revealed.includes(player.id) || (revealAllAtEnd && game.handComplete)}
               />
             ))}
             {game.players.map((player, seat) => (
@@ -535,6 +1197,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 player={player}
                 seat={seat}
                 dealer={seat === game.dealerIndex}
+                won={potAwards[player.id] ?? 0}
               />
             ))}
           </div>
@@ -551,6 +1214,16 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                       </strong>
                     </div>
                   </div>
+                  <button
+                    type="button"
+                    className={`reveal-toggle ${revealAllAtEnd ? "on" : ""}`}
+                    onClick={toggleRevealAll}
+                    aria-pressed={revealAllAtEnd}
+                    title="结算后把所有座位的底牌翻开，并写进牌谱"
+                  >
+                    <i />
+                    <span>结算亮牌</span>
+                  </button>
                   <button className="primary-action next-hand" onClick={newHand}>
                     下一手 <kbd>N</kbd>
                   </button>
@@ -570,7 +1243,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                     )}
                     {heroLegal.includes("call") && (
                       <button className="call-button" onClick={() => act("call")}>
-                        <span>Call</span><b>{toCall}</b><kbd>C</kbd>
+                        <span>Call</span><b>{amountBB(toCall)}</b><kbd>C</kbd>
                       </button>
                     )}
                   </div>
@@ -578,18 +1251,39 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                     {heroLegal.includes("raise") && (
                       <div className="raise-control">
                         <div className="raise-presets">
-                          {[0.33, 0.75, 1].map((size) => {
-                            const target = Math.min(
-                              maxRaiseTo,
-                              Math.max(minRaiseTo, Math.round(game.currentBet + totalPot(game) * size)),
-                            );
+                          {(preflop ? MULTIPLE_PRESETS : POT_PRESETS).map((size) => {
+                            const natural = preflop
+                              ? multipleRaiseTo(size, game.currentBet)
+                              : potRelativeRaiseTo(size, totalPot(game), game.currentBet, toCall);
+                            // 低于最小加注额的尺寸做不出来，点了只会得到别的数字——直接禁用，
+                            // 而不是悄悄钳到最小值让按钮说谎。
+                            const tooSmall = natural < minRaiseTo;
+                            const target = Math.min(maxRaiseTo, natural);
                             return (
-                              <button key={size} onClick={() => setRaiseTo(target)}>
-                                {Math.round(size * 100)}%
+                              <button
+                                key={size}
+                                type="button"
+                                className={raiseTo === target && !tooSmall ? "active" : ""}
+                                disabled={tooSmall}
+                                title={
+                                  tooSmall
+                                    ? `低于最小加注 ${amountBB(minRaiseTo)}`
+                                    : `加注到 ${amountBB(target)}`
+                                }
+                                onClick={() => setRaiseTo(target)}
+                              >
+                                {preflop ? `${size}x` : `${Math.round(size * 100)}%`}
                               </button>
                             );
                           })}
-                          <button onClick={() => setRaiseTo(maxRaiseTo)}>ALL-IN</button>
+                          <button
+                            type="button"
+                            className={raiseTo === maxRaiseTo ? "active" : ""}
+                            title={`全下 ${amountBB(maxRaiseTo)}`}
+                            onClick={() => setRaiseTo(maxRaiseTo)}
+                          >
+                            ALL-IN
+                          </button>
                         </div>
                         <div className="raise-main">
                           <input
@@ -601,7 +1295,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                             onChange={(event) => setRaiseTo(Number(event.target.value))}
                           />
                           <button className="primary-action" onClick={() => act("raise", raiseTo)}>
-                            <span>Raise to</span><b>{raiseTo}</b><kbd>R</kbd>
+                            <span>Raise to</span><b>{amountBB(raiseTo)}</b><kbd>R</kbd>
                           </button>
                         </div>
                       </div>
@@ -640,18 +1334,26 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 {signedBb(sessionResultBb)}
               </strong>
             </div>
-            <div title="没有在河牌前锁定全下的牌局按实际结果计入，锁定全下的牌局改用其期望结果">
-              <span>ALL-IN EV · 累计</span>
+            {/* 这一栏原来叫「ALL-IN EV」，但它从来不是那几手全下的 EV，而是把全下牌局换成
+                期望值之后的整段盈亏——只打了一手全下的人看到 -46BB 会以为是那一手的 EV。
+                改名叫「全下调整后」，并把那几手全下自己的 EV 单独列出来。 */}
+            <div title="把在河牌前锁定全下的牌局换成它们的期望结果，其余牌局按实际结果计入；这是剔除发牌运气后的整段盈亏">
+              <span>全下调整后 · 累计</span>
               <strong className={sessionEvBb >= 0 ? "positive" : "negative"}>
                 {signedBb(sessionEvBb)}
               </strong>
-              <small>{allInEvHands} 手产生 EV 调整</small>
+              <small>
+                {allInEvHands === 0
+                  ? "本段没有全下牌局"
+                  : `${allInEvHands} 手全下，其 EV 合计 ${signedBb(sessionAllInEvBb)}`}
+              </small>
             </div>
-            <div title="实际净结果减去累计 All-in EV">
+            <div title="只统计全下牌局：实际拿到的减去应该拿到的。正数是赢了本不该赢的，负数是被反超">
               <span>运气差 · 累计</span>
               <strong className={sessionLuckBb >= 0 ? "lucky" : "unlucky"}>
                 {signedBb(sessionLuckBb)}
               </strong>
+              <small>实际 = 调整后 + 运气差</small>
             </div>
           </div>
           <div className="log-list">
@@ -670,7 +1372,9 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                       {hand.resultBb >= 0 ? "+" : ""}{hand.resultBb.toFixed(1)} BB
                     </span>
                   </div>
-                  <p>{hand.markdown}</p>
+                  {/* 侧栏只显示 H# 那一行：理由现在跟在它下面，全塞进这个 8px、
+                      三行截断的预览框里只会把牌局摘要挤掉。完整内容走复制/下载。 */}
+                  <p>{hand.markdown.split("\n")[0]}</p>
                   {typeof hand.evBb === "number" && typeof hand.luckBb === "number" && (
                     <div className="hand-ev-line">
                       <span>All-in EV {signedBb(hand.evBb)}</span>
@@ -711,10 +1415,40 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
               <div>
                 <span>TABLE LINEUP</span>
                 <h2>7 位 AI 对手</h2>
-                <p>同一 API，不同系统人格；买入与打法独立。</p>
+                <p>
+                  当前档位「{tierDefinition.title}」·
+                  同一 API，不同系统人格；买入与打法独立。
+                </p>
               </div>
               <button onClick={() => setShowPlayers(false)} aria-label="关闭">×</button>
             </header>
+            {/*
+              Difficulty is a lineup, not a hidden dial: each tier seats a different mix of the
+              same seven personas, so the blurb below is the whole truth about what changed.
+            */}
+            <section className="tier-card" aria-label="难度档位">
+              <div className="tier-heading">
+                <span>TABLE TIER</span>
+                <h3>难度档位</h3>
+                <em>切换会重开牌桌</em>
+              </div>
+              <div className="tier-options" role="radiogroup" aria-label="难度档位选择">
+                {(Object.keys(TABLE_TIERS) as TableTier[]).map((id) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="radio"
+                    aria-checked={tier === id}
+                    className={tier === id ? "selected" : ""}
+                    onClick={() => switchTier(id)}
+                  >
+                    <b>{TABLE_TIERS[id].title}</b>
+                    <small>{id.toUpperCase()}</small>
+                  </button>
+                ))}
+              </div>
+              <p className="tier-blurb">{tierDefinition.blurb}</p>
+            </section>
             <section className={`api-settings-card ${apiConnection}`}>
               <div className="api-settings-copy">
                 <span>DEEPSEEK API</span>
@@ -790,6 +1524,19 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                 </span>
                 <small>不会写入牌谱、训练记录或云端数据库</small>
               </div>
+              {/*
+                Read-only mirror of what the AIs are told about you. It lives in this modal on
+                purpose: showing it at the table during a live hand would turn the AIs' intel into
+                a hint for the human (V2 §三.5).
+              */}
+              <div className="api-settings-status hero-profile-line" role="status">
+                <i />
+                <span>
+                  已建模 {heroProfile.handsDealt} 手 ·{" "}
+                  {heroProfile.text || "样本不足，继续打"}
+                </span>
+                <small>每位 AI 都会读到这一行</small>
+              </div>
             </section>
             <div className="persona-grid">
               {game.players.filter((player) => !player.isHero).map((player) => (
@@ -805,6 +1552,10 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                   <FrequencyBar label="入池" value={player.persona.looseness} color={player.persona.color} />
                   <FrequencyBar label="进攻" value={player.persona.aggression} color={player.persona.color} />
                   <FrequencyBar label="诈唬" value={player.persona.bluff} color={player.persona.color} />
+                  <p className="persona-rebuy">
+                    <span>补码</span>
+                    {player.persona.rebuy.label}
+                  </p>
                 </article>
               ))}
             </div>
@@ -813,6 +1564,11 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
               {apiReady
                 ? `${apiSettings ? "DeepSeek 已连接" : "统一 API 已连接"}：每次行动发送独立、脱敏后的玩家视角。`
                 : "当前使用本地人格引擎；配置统一 API 后会自动切换。"}
+              {sourceTally && (
+                <small className="source-tally" title="最近 100 个 AI 动作的来源统计">
+                  {sourceTally}
+                </small>
+              )}
             </footer>
           </section>
         </div>

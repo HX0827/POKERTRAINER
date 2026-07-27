@@ -373,10 +373,13 @@ button {
   color: #d62929;
 }
 
+/* Opponent cards are read only by their top strip — the rest sits behind the player
+   plate. The tall bottom padding lifts the suit glyph out of the covered band so a
+   revealed hand is legible at showdown; see .hole-cards for the matching offset. */
 .playing-card.small {
   width: 35px;
-  height: 49px;
-  padding: 4px;
+  height: 45px;
+  padding: 4px 4px 8px;
 }
 
 .playing-card.small b {
@@ -511,11 +514,16 @@ button {
   font: 800 7px var(--font-data);
 }
 
+/* The cards sit behind the player plate, so only the part above the plate is readable.
+   `bottom` is tuned so a revealed card clears the plate by all but a few px: the suit
+   glyph lives at the card's bottom edge, so anything more than a token tuck hides it
+   at showdown. The top-row seats (3/4/5) are positioned lower to pay for the extra
+   height — see .seat-3/.seat-4/.seat-5. */
 .hole-cards {
   height: 34px;
   position: absolute;
   left: 50%;
-  bottom: 45px;
+  bottom: 62px;
   display: flex;
   gap: 2px;
   transform: translateX(-50%) rotate(-1deg);
@@ -524,7 +532,7 @@ button {
 
 .hero-seat .hole-cards {
   height: 55px;
-  bottom: 47px;
+  bottom: 54px;
   z-index: 0;
 }
 
@@ -609,21 +617,91 @@ button {
   box-shadow: 0 -3px 0 #9f231f, 0 -5px 0 #d0332d;
 }
 
-.marker-seat-0 { left: 50%; top: 75%; }
-.marker-seat-1 { left: 28%; top: 71%; }
-.marker-seat-2 { left: 18%; top: 52%; }
-.marker-seat-3 { left: 29%; top: 31%; }
-.marker-seat-4 { left: 50%; top: 27%; }
-.marker-seat-5 { left: 71%; top: 31%; }
-.marker-seat-6 { left: 82%; top: 52%; }
-.marker-seat-7 { left: 72%; top: 71%; }
+/* 结算：底池推给赢家。中间的数字淡出但保留占位，公共牌不许跳。 */
+.pot-settled {
+  opacity: 0;
+  transform: scale(.9);
+  transition: opacity 260ms ease, transform 260ms ease;
+}
+
+/* 赢家面前那一堆：比普通下注筹码高一截、金色，隔着一张桌子也认得出。 */
+.won-bet {
+  padding: 3px 9px 3px 7px;
+  border-radius: 11px;
+  color: #ffe7b0;
+  background: rgba(242, 190, 70, .18);
+  box-shadow: inset 0 0 0 1px rgba(242, 190, 70, .5), 0 5px 16px rgba(0,0,0,.5);
+  font: 800 10px var(--font-data);
+}
+
+.chip-pile {
+  display: inline-block;
+  width: 15px;
+  height: 9px;
+  margin-top: 11px;
+  border-radius: 50%;
+  background: #f2be46;
+  border: 2px dashed #fff6e2;
+  box-shadow: 0 -3px 0 #c0902a, 0 -5px 0 #f2be46, 0 -8px 0 #c0902a, 0 -10px 0 #f2be46;
+}
+
+/* 筹码从桌心滑到赢家面前。keyframes 里只写 from——left/top 的终点由浏览器取
+   .marker-seat-N 上的原值，所以一条动画就适配八个座位，不用给每个座位手写像素偏移，
+   牌桌怎么缩放都不会跑偏。 */
+@keyframes chips-to-winner {
+  from {
+    /* 起点就是「总底池」那块牌子的位置（.table-center 居中于 48%，底池标签在公共牌上方
+       约 9%），不是牌桌几何中心——从底池数字消失的地方出发才说得通。 */
+    left: 50%;
+    top: 39%;
+    opacity: .25;
+  }
+}
+
+.marker-won {
+  z-index: 11;
+  /* 180ms 延迟：先让中间的底池淡掉，再推筹码，顺序才读得出「这堆钱是从底池过来的」。
+     曲线不用常见的 ease-out——它前 30% 就走完 85% 的距离，实测几乎看不见移动。 */
+  animation: chips-to-winner 700ms cubic-bezier(.36, .06, .22, 1) 180ms both;
+}
+
+/* 2/6 号位在牌桌正左/正右，名牌正好贴在同一高度的桌边上，金色筹码堆比普通下注标记宽，
+   居中放会蹭到名牌。结算时这两个标记里只剩筹码堆（动作标签已经让位），所以可以改成
+   贴中心侧对齐——内容朝绒面里长而不是朝桌边长。只对赢家生效，不动牌局进行中的标记：
+   进行中那里还有最宽 118px 的动作标签，一旦改成侧对齐就会顶到公共牌上。 */
+.marker-won.marker-seat-2 { transform: none; }
+.marker-won.marker-seat-6 { transform: translateX(-100%); }
+
+@media (prefers-reduced-motion: reduce) {
+  .marker-won { animation-duration: 1ms; }
+}
+
+/* 筹码落点由牌桌椭圆几何算出（rail: left 11.5% / top 17% / 77%×63%），不是手调的。
+   三条规则：
+   1. 每个座位的筹码放在中心到该座位方向 60% 半径处，保证落在绒面上而不是木质台边。
+   2. 下半桌（0/1/7）标签翻到筹码下方——标签朝玩家、筹码朝中心。原来全桌标签都在上方，
+      对上半桌是背离中心的，对下半桌却把标签推向中心，正好压住公共牌。
+   3. 正左/正右（2/6）抬高 6%，避开五张公共牌那一行的高度，改到较窄的底池标签一层。
+   六个视口实测：筹码全在绒面内（最小边距 5.9%），不压底池/公共牌，互不重叠。 */
+.marker-seat-0 { left: 50.0%; top: 66.4%; flex-direction: column-reverse; }
+.marker-seat-1 { left: 33.7%; top: 60.9%; flex-direction: column-reverse; }
+.marker-seat-2 { left: 26.9%; top: 38.0%; }
+.marker-seat-3 { left: 33.7%; top: 30.6%; }
+.marker-seat-4 { left: 50.0%; top: 25.1%; }
+.marker-seat-5 { left: 66.3%; top: 30.6%; }
+.marker-seat-6 { left: 73.1%; top: 38.0%; }
+.marker-seat-7 { left: 66.3%; top: 60.9%; flex-direction: column-reverse; }
 
 .seat-0 { left: 50%; bottom: 0; transform: translateX(-50%); }
 .seat-1 { left: 5%; bottom: 11%; }
 .seat-2 { left: 0; top: 42%; }
-.seat-3 { left: 12%; top: 7%; }
-.seat-4 { left: 50%; top: 5%; transform: translateX(-50%); }
-.seat-5 { right: 12%; top: 7%; }
+/* Top row sits lower than the sides: their hole cards extend upward and would
+   otherwise be clipped by the stage on short viewports. */
+/* The px floor matters on short viewports: the stage compresses the table's top margin,
+   and a pure percentage would pull the top row up into the stage edge. */
+.seat-3 { left: 12%; top: max(8.5%, 60px); }
+.seat-4 { left: 50%; top: max(6.5%, 48px); transform: translateX(-50%); }
+.seat-5 { right: 12%; top: max(8.5%, 60px); }
 .seat-6 { right: 0; top: 42%; }
 .seat-7 { right: 5%; bottom: 11%; }
 
@@ -730,7 +808,7 @@ kbd {
   height: 100%;
   min-width: 0;
   display: grid;
-  grid-template-rows: 20px 1fr;
+  grid-template-rows: auto 1fr;
   gap: 6px;
 }
 
@@ -748,21 +826,41 @@ kbd {
   accent-color: #e33d36;
 }
 
+/* 12 个尺寸档（11 个底池比例 + ALL-IN）排成 6×2；一行放不下，两行才够读。 */
 .raise-presets {
-  display: flex;
-  justify-content: flex-end;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 3px;
 }
 
 .raise-presets button {
-  min-width: 40px;
-  padding: 3px 8px;
+  min-width: 0;
+  padding: 3px 4px;
   border: 1px solid rgba(255,255,255,.05);
   border-radius: 5px;
   color: #9ca3ab;
   background: rgba(255,255,255,.06);
   font: 750 7px var(--font-data);
   cursor: pointer;
+  transition: 120ms ease;
+}
+
+.raise-presets button:hover:not(:disabled) {
+  color: #e2e6ea;
+  background: rgba(255,255,255,.12);
+}
+
+/* 当前滑块正好落在某个档位上时点亮它，12 个按钮里一眼看出现在打的是几成池。 */
+.raise-presets button.active {
+  color: #ffd9a1;
+  border-color: rgba(242, 190, 70, .45);
+  background: rgba(242, 190, 70, .16);
+}
+
+/* 低于最小加注额的档位做不出来，禁用而不是悄悄改成别的数字。 */
+.raise-presets button:disabled {
+  opacity: .3;
+  cursor: not-allowed;
 }
 
 .primary-action {
@@ -1125,6 +1223,92 @@ kbd {
   margin: 5px 0 0;
   color: #7f8790;
   font-size: 10px;
+}
+
+/* Difficulty tier picker — sits above the API card at the top of the lineup modal. */
+.tier-card {
+  margin: 14px 14px 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at 8% 0%, rgba(244, 195, 79, .07), transparent 42%),
+    #181d22;
+  border: 1px solid rgba(255,255,255,.08);
+}
+
+.tier-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+
+.tier-heading > span {
+  color: #d2ad57;
+  font: 850 8px var(--font-data);
+  letter-spacing: .14em;
+}
+
+.tier-heading h3 {
+  margin: 0;
+  font-size: 12px;
+}
+
+.tier-heading em {
+  margin-left: auto;
+  color: #606a73;
+  font: normal 700 8px var(--font-data);
+}
+
+.tier-options {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 7px;
+}
+
+.tier-options button {
+  padding: 9px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: center;
+  border-radius: 9px;
+  cursor: pointer;
+  color: #aeb5bc;
+  background: #12161a;
+  border: 1px solid rgba(255,255,255,.08);
+  transition: border-color .16s, background .16s, color .16s;
+}
+
+.tier-options button:hover {
+  border-color: rgba(244, 195, 79, .34);
+}
+
+.tier-options button b {
+  font-size: 11px;
+}
+
+.tier-options button small {
+  color: #606a73;
+  font: 800 7px var(--font-data);
+  letter-spacing: .12em;
+}
+
+.tier-options button.selected {
+  color: #f4c34f;
+  background: rgba(244, 195, 79, .09);
+  border-color: rgba(244, 195, 79, .48);
+}
+
+.tier-options button.selected small {
+  color: #b3913f;
+}
+
+.tier-blurb {
+  margin: 9px 0 0;
+  color: #7f8790;
+  font-size: 9px;
+  line-height: 1.55;
 }
 
 .api-settings-card {
@@ -1559,6 +1743,13 @@ kbd {
   }
   .player-seat { width: 145px; }
   .player-panel { height: 48px; }
+  /* The plate is 6px shorter here and the table is scaled down, so the cards can sit
+     lower (keeping their tuck) while the top row drops enough to clear the stage edge. */
+  .hole-cards { bottom: 56px; }
+  /* 缩放后的小桌上 118px 的标签会伸到公共牌上，同时也读不清 */
+  .marker-action { max-width: 92px; }
+  .seat-3, .seat-5 { top: 10%; }
+  .seat-4 { top: 8%; }
   .avatar { width: 32px; height: 32px; flex-basis: 32px; }
   .rail { width: 74%; left: 13%; top: 19%; }
   .community-cards { gap: 3px; }
@@ -1591,6 +1782,8 @@ kbd {
     margin-left: 13px;
   }
   .persona-grid { grid-template-columns: 1fr; }
+  .tier-heading { flex-wrap: wrap; }
+  .tier-heading em { margin-left: 0; width: 100%; }
   .log-panel { top: 58px; }
 }
 
@@ -1618,4 +1811,108 @@ kbd {
   .buyin-options {
     grid-template-columns: repeat(3, 1fr);
   }
+}
+
+/* Amber pipeline chip: the API is configured but this hand already fell back to the
+   local engine at least once (docs/AI决策改造设计.md §7.3). Mirrors .status-chip.online/.local. */
+.status-chip.degraded {
+  color: #f1cd94;
+  background: #1b1712;
+  border-color: rgba(255, 177, 59, .26);
+}
+
+.status-chip.degraded i {
+  background: #ffb13b;
+  box-shadow: 0 0 12px rgba(255, 177, 59, .6);
+}
+
+.persona-modal footer .source-tally {
+  margin-left: auto;
+  padding-left: 10px;
+  white-space: nowrap;
+  color: #9aa2ab;
+  font: 700 9px var(--font-data);
+  letter-spacing: .04em;
+}
+
+.persona-rebuy {
+  margin: 6px 0 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  color: #8a929c;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.persona-rebuy span {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: #b9c0c9;
+  background: rgba(255, 255, 255, .06);
+  font: 800 8px var(--font-data);
+}
+
+/* "结算亮牌": after a hand settles, every seat is turned face-up for review. Lives in the
+   settled-hand dock next to 下一手, since that is the only moment it applies. */
+.reveal-toggle {
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  border-radius: 9px;
+  color: #8c939c;
+  background: #14181c;
+  border: 1px solid rgba(255, 255, 255, .07);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: 150ms ease;
+}
+
+.reveal-toggle span {
+  font: 800 10px var(--font-data);
+  letter-spacing: .04em;
+}
+
+.reveal-toggle i {
+  width: 22px;
+  height: 12px;
+  border-radius: 12px;
+  position: relative;
+  background: #2b3138;
+  transition: background 150ms ease;
+}
+
+.reveal-toggle i::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #767d86;
+  transition: 150ms ease;
+}
+
+.reveal-toggle:hover {
+  border-color: rgba(255, 255, 255, .16);
+}
+
+.reveal-toggle.on {
+  color: #d8e2dd;
+  border-color: rgba(57, 220, 152, .3);
+  background: rgba(0, 169, 111, .1);
+}
+
+.reveal-toggle.on i {
+  background: rgba(57, 220, 152, .35);
+}
+
+.reveal-toggle.on i::after {
+  left: 12px;
+  background: #39dc98;
+  box-shadow: 0 0 8px rgba(57, 220, 152, .8);
 }

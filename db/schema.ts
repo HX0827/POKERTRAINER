@@ -13,3 +13,14 @@ export const pokerHands = sqliteTable("poker_hands", {
   markdown: text("markdown").notNull(),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
+
+/**
+ * Per-hand public behavioural increments for the one human seat (CONTRACT-V2 §二).
+ * `counters` holds a `HeroCounters` JSON blob; the profile is the sum of the rows.
+ */
+export const heroHandStats = sqliteTable("hero_hand_stats", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  handId: text("hand_id").notNull().unique(),
+  counters: text("counters").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});

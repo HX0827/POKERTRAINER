@@ -43,3 +43,6 @@ next-env.d.ts
 /outputs/
 /work/
 /.local-run/
+
+# 撤回改动时暂存的待删文件
+/_to_delete/
