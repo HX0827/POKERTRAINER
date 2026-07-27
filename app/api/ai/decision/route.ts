@@ -59,9 +59,10 @@ const MAX_TOKENS = 700;
 // 思考要设预算:不设的话模型高兴起来想上几千 token,一个决策十几秒,牌桌等不起。
 // 800 token 足够把"牌面上有没有人打得过我"这类事想明白——要的是不读错牌,不是解 GTO。
 const THINKING_BUDGET_TOKENS = 800;
-// 思考模式下有的接口把思考 token 也计入 max_tokens;思考预算 800 + 答案 700,
-// 给 2000 留足余量,按实际生成计费,不吃亏。
-const MAX_TOKENS_THINKING = 2000;
+// 思考模式下思考 token 计入 max_tokens,而 budget_tokens 疑似被 API 忽略(实测思考
+// 跑长后返回 200 + 空 content,正是"额度被思考吃光"的症状)。给到 8000:思考再长
+// 也轮得到答案落地,按实际生成计费,不吃亏。真正的延迟上限由超时和耐心档管。
+const MAX_TOKENS_THINKING = 8000;
 const FIRST_TEMPERATURE = 0.45;
 const RETRY_TEMPERATURE = 0.2;
 // 思考档首问的天花板。思考请求对冲(见 hedgedThinkingCall):发出去 THINKING_HEDGE_DELAY_MS
@@ -69,13 +70,21 @@ const RETRY_TEMPERATURE = 0.2;
 // 回退本地引擎只剩"两条腿全断"一种情况。重问一律快答:那是在纠错格式/非法动作,
 // 不需要再想一遍。快答档沿用原来的 5/3.5 秒,垃圾牌盖牌像真人一样不假思索。
 const FIRST_TIMEOUT_MS = 10000;
-const THINKING_HEDGE_DELAY_MS = 4000;
+// 大决策(耐心档)的思考上限。budget_tokens 被 API 忽略,思考长短只能靠提示词软约束
+// + 这个硬超时兜底;15 秒对大池子不算失礼——真人 tank 起来只会更久。
+const PATIENT_TIMEOUT_MS = 15000;
+const THINKING_HEDGE_DELAY_MS = 6000;
 const FIRST_TIMEOUT_FAST_MS = 5000;
 const RETRY_TIMEOUT_FAST_MS = 3500;
 // 思考一律用 Flash,不管齿轮里选的什么:思考的用途只是"牌面上谁打得过我"这类
 // 基础验算,Flash 的推理够用,而延迟只有 Pro 思考的一小半——对冲延迟才敢收到 4 秒。
 // 快答/翻前/重问仍然用玩家选的模型,人格和语感不变。
 const THINKING_MODEL = "deepseek-v4-flash";
+// 大决策不做对冲:底池或面对的注到了这个量级,决策质量比几秒等待重要——H#0018
+// 一个 157BB 的池子四个决策全是快答赢的,这不该发生。思考臂给满 FIRST_TIMEOUT_MS,
+// 它失败才轮到快答。
+const BIG_POT_THINK_BB = 50;
+const BIG_CALL_THINK_BB = 20;
 // 牌谱里 AI 的理由整句保留才有复盘价值。以前是 140,模型稍一展开就被拦腰切断
 // ("reverse implied od")。340 够写三四句完整的英文;真超了由 clampReason 在词界收尾。
 const REASON_MAX_CHARS = 340;
@@ -399,6 +408,8 @@ interface ProviderResult {
   failure: FailReason | null;
   /** 这条内容是深度思考给出的吗?对冲之后快答经常赢,牌谱要能看出每个决策的成色。 */
   thought?: boolean;
+  /** 服务端错误正文片段。只进终端日志帮人排障,不进牌局。 */
+  detail?: string;
 }
 
 function classifyFetchError(error: unknown): FailReason {
@@ -430,6 +441,9 @@ async function callProvider(options: {
         model: options.model,
         temperature: options.temperature,
         max_tokens: options.disableThinking ? MAX_TOKENS : MAX_TOKENS_THINKING,
+        // 实测开思考后 API 会回 SSE 流(200 + data: 行),显式关掉;万一它不理,
+        // 下面的 salvageStreamContent 还能把流拼回完整内容。
+        stream: false,
         ...(options.disableThinking
           ? { thinking: { type: "disabled" } }
           : { thinking: { type: "enabled", budget_tokens: THINKING_BUDGET_TOKENS } }),
@@ -438,16 +452,46 @@ async function callProvider(options: {
       }),
       signal: AbortSignal.timeout(options.timeoutMs),
     });
-    if (!response.ok) return { content: null, failure: "provider-error" };
-    let data: { choices?: Array<{ message?: { content?: string } }> };
-    try {
-      data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    } catch {
-      return { content: null, failure: "provider-error" };
+    if (!response.ok) {
+      // 错误正文进终端:思考参数被拒、模型名不对这类问题,不看正文永远猜不到。
+      const errorBody = (await response.text().catch(() => "")).slice(0, 300);
+      console.warn(
+        `[decision] provider ${response.status} (${options.model}${options.disableThinking ? "" : " +thinking"}): ${errorBody}`,
+      );
+      return { content: null, failure: "provider-error", detail: errorBody };
     }
-    const content = data.choices?.[0]?.message?.content;
+    const raw = await response.text();
+    let data: {
+      choices?: Array<{
+        message?: { content?: string; reasoning_content?: string };
+        finish_reason?: string;
+      }>;
+      usage?: unknown;
+    };
+    try {
+      data = JSON.parse(raw) as typeof data;
+    } catch {
+      // 不是 JSON:先当 SSE 流拼一把,拼出来照用;拼不出来把正文开头晒进日志。
+      const salvaged = salvageStreamContent(raw);
+      if (salvaged) return { content: salvaged, failure: null, thought: !options.disableThinking };
+      console.warn(
+        `[decision] provider 返回非 JSON,也不是可解析的流 (${options.model}${options.disableThinking ? "" : " +thinking"}): ${raw.slice(0, 200)}`,
+      );
+      return { content: null, failure: "provider-error", detail: "non-json body" };
+    }
+    const choice = data.choices?.[0];
+    const content = choice?.message?.content;
     if (typeof content !== "string" || !content.trim()) {
-      return { content: null, failure: "provider-error" };
+      // 200 + 空内容:大概率是思考吃光了 max_tokens(finish=length),这行日志能证实。
+      const reasoningLen = String(choice?.message?.reasoning_content ?? "").length;
+      console.warn(
+        `[decision] provider 空内容 (${options.model}${options.disableThinking ? "" : " +thinking"}): finish=${choice?.finish_reason ?? "?"} 思考文本=${reasoningLen}字 usage=${JSON.stringify(data.usage ?? null)}`,
+      );
+      return {
+        content: null,
+        failure: "provider-error",
+        detail: `empty content, finish=${choice?.finish_reason ?? "?"}`,
+      };
     }
     return { content, failure: null, thought: !options.disableThinking };
   } catch (error) {
@@ -457,6 +501,32 @@ async function callProvider(options: {
 
 function delay(ms: number): Promise<undefined> {
   return new Promise((resolve) => setTimeout(() => resolve(undefined), ms));
+}
+
+/**
+ * 把 SSE 流(`data: {...}` 行)拼回完整内容。思考请求实测会拿到 200 + 流式正文,
+ * 即使请求里写了 stream: false 也可能如此。只取 content 增量,思考文本(reasoning)
+ * 本来就不需要;解析不动的行直接跳过,拼不出内容返回 null,由调用方决定去留。
+ */
+function salvageStreamContent(raw: string): string | null {
+  let text = "";
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const chunk = JSON.parse(payload) as {
+        choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>;
+      };
+      const piece = chunk.choices?.[0]?.delta?.content ?? chunk.choices?.[0]?.message?.content;
+      if (typeof piece === "string") text += piece;
+    } catch {
+      // 坏行跳过:拼回内容是尽力而为,不值得为一行日志中断整个决策。
+    }
+  }
+  const result = text.trim();
+  return result ? result : null;
 }
 
 /** Resolve with the first result that carries content; if none does, with the last failure. */
@@ -484,19 +554,61 @@ function firstWithContent(calls: Array<Promise<ProviderResult>>): Promise<Provid
  * 本地引擎——所以只有两条腿全断才算失败。代价是慢局面偶尔为同一个决策付两份 token。
  * 输掉的思考请求不做取消,FIRST_TIMEOUT_MS 的 AbortSignal 自然收尸。
  */
+/** 大池子、大注、或跟注等于全下:这个决策值得等,思考臂不参加赛跑。 */
+function isBigDecision(observation: BotObservation): boolean {
+  const bb = observation.blinds?.bigBlind || 2;
+  return (
+    observation.pot >= BIG_POT_THINK_BB * bb ||
+    observation.toCall >= BIG_CALL_THINK_BB * bb ||
+    (observation.toCall > 0 && observation.toCall >= observation.stack)
+  );
+}
+
 async function hedgedThinkingCall(
   provider: { apiBase: string; apiKey: string; model: string },
   messages: ChatMessage[],
   temperature: number,
+  /** true = 大决策:不对冲,思考臂给满超时,失败才用快答。 */
+  patient: boolean,
 ): Promise<ProviderResult> {
+  // budget_tokens 管不住思考长度,那就在提示词里管:点名只验算两件要紧事。
+  // 对推理模型这是软约束,但实测比不说强得多。
+  const thinkingMessages = messages.map((message, index) =>
+    index === 0 && message.role === "system"
+      ? {
+          ...message,
+          content: `${message.content}\n\nKeep your hidden reasoning SHORT (well under 200 words): verify what hands beat yours on this board, check the pot odds, then decide. No range combinatorics.`,
+        }
+      : message,
+  );
   const thinking = callProvider({
     ...provider,
     model: THINKING_MODEL,
     disableThinking: false,
-    messages,
+    messages: thinkingMessages,
     temperature,
-    timeoutMs: FIRST_TIMEOUT_MS,
+    timeoutMs: patient ? PATIENT_TIMEOUT_MS : FIRST_TIMEOUT_MS,
   });
+  // 无论这条腿最终有没有被采用,失败原因都要落到终端:TH 一直是 0 的时候,
+  // 看这行日志就能分清是"参数被拒"(provider-error+正文)还是"太慢输给快答"(timeout)。
+  void thinking.then((result) => {
+    if (!result.content) {
+      console.warn(
+        `[decision] 思考臂未产出 (${result.failure ?? "unknown"})${result.detail ? `: ${result.detail}` : ""}`,
+      );
+    }
+  });
+  if (patient) {
+    const settled = await thinking;
+    if (settled.content) return settled;
+    return callProvider({
+      ...provider,
+      disableThinking: true,
+      messages,
+      temperature,
+      timeoutMs: FIRST_TIMEOUT_FAST_MS,
+    });
+  }
   const early = await Promise.race([thinking, delay(THINKING_HEDGE_DELAY_MS)]);
   if (early?.content) return early;
   const fast = callProvider({
@@ -657,6 +769,7 @@ export async function POST(request: NextRequest) {
           { apiBase, apiKey, model },
           baseMessages,
           FIRST_TEMPERATURE,
+          isBigDecision(observation),
         );
 
     // No usable first answer: only a provider-side HTTP/body failure earns a second attempt.

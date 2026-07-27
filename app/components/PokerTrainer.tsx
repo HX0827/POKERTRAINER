@@ -141,8 +141,8 @@ const DIRECTIVE_LIMITS: Record<"light" | "normal" | "hard", number> = {
   normal: 3,
   hard: 5,
 };
-/** Client-side ceiling; the route budgets up to ~13.5s (对冲首问 10s + 快答重问 3.5s), so this only catches a hung socket. */
-const DECISION_TIMEOUT_MS = 16000;
+/** Client-side ceiling; the route's worst path is a big-decision one (思考 15s 失败 + 快答 5s + 重问 3.5s ≈ 23.5s), so this only catches a hung socket. */
+const DECISION_TIMEOUT_MS = 26000;
 /** Provenance is kept for the current hand plus this many previous hands, then pruned. */
 const KEPT_HAND_HISTORY = 2;
 /** Persona-modal footer tallies at most this many of the most recent AI actions. */
