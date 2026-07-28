@@ -46,6 +46,19 @@ test("static seat facts come from the code, not from storage", () => {
   assert.equal(parsed.players[1].persona.buyInBB, game.players[1].persona.buyInBB);
 });
 
+test("a fresh table honours a requested opening button seat, and rejects junk", () => {
+  assert.equal(startHand(undefined, { dealerIndex: 3 }).dealerIndex, 3);
+  assert.equal(startHand(undefined, { dealerIndex: 0 }).dealerIndex, 0);
+  // Out-of-range or fractional requests fall back to the traditional seat 7.
+  assert.equal(startHand(undefined, { dealerIndex: 8 }).dealerIndex, 7);
+  assert.equal(startHand(undefined, { dealerIndex: -1 }).dealerIndex, 7);
+  assert.equal(startHand(undefined, { dealerIndex: 2.5 }).dealerIndex, 7);
+  assert.equal(startHand().dealerIndex, 7);
+  // A continuing table ignores the request: the button always moves one seat.
+  const previous = startHand();
+  assert.equal(startHand(previous, { dealerIndex: 3 }).dealerIndex, (previous.dealerIndex + 1) % 8);
+});
+
 test("parseSavedGame rejects everything malformed instead of throwing", () => {
   const good = JSON.parse(serializeGame(startHand()));
   const withGame = (mutate) => {

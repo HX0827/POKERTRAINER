@@ -731,6 +731,11 @@ export interface StartHandOptions {
    * Ignored while the table simply continues.
    */
   heroBuyInBB?: number;
+  /**
+   * 新开/重开牌桌时按钮的起始座位(0..7)。不传维持老规矩 7;「重置对局」传随机值,
+   * 免得每次重置 hero 都从同一个位置开局。牌局延续时忽略——按钮永远顺移。
+   */
+  dealerIndex?: number;
 }
 
 export function startHand(previous?: GameState, options?: StartHandOptions): GameState {
@@ -739,7 +744,12 @@ export function startHand(previous?: GameState, options?: StartHandOptions): Gam
   // Changing the lineup changes who is sitting there, so carrying stacks would be meaningless:
   // everyone re-buys, and the button goes back to its opening seat.
   const reopened = Boolean(previous) && tier !== previousTier;
-  const dealerIndex = previous && !reopened ? nextSeat(previous.dealerIndex) : 7;
+  const requestedSeat = options?.dealerIndex;
+  const openingSeat =
+    Number.isInteger(requestedSeat) && (requestedSeat as number) >= 0 && (requestedSeat as number) < 8
+      ? (requestedSeat as number)
+      : 7;
+  const dealerIndex = previous && !reopened ? nextSeat(previous.dealerIndex) : openingSeat;
   const carriedPlayers = reopened ? undefined : previous?.players;
   let players = positionPlayers(freshPlayers(carriedPlayers, tier), dealerIndex);
   if (reopened && typeof options?.heroBuyInBB === "number" && options.heroBuyInBB > 0) {

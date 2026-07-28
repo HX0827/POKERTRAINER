@@ -141,8 +141,8 @@ const DIRECTIVE_LIMITS: Record<"light" | "normal" | "hard", number> = {
   normal: 3,
   hard: 5,
 };
-/** Client-side ceiling; the route's worst path is a big-decision one (思考 15s 失败 + 快答 5s + 重问 3.5s ≈ 23.5s), so this only catches a hung socket. */
-const DECISION_TIMEOUT_MS = 26000;
+/** Client-side ceiling; the route's worst path is a big-decision one (思考 25s + 快答 5s + 重问 3.5s ≈ 33.5s), so this only catches a hung socket. */
+const DECISION_TIMEOUT_MS = 36000;
 /** Provenance is kept for the current hand plus this many previous hands, then pruned. */
 const KEPT_HAND_HISTORY = 2;
 /** Persona-modal footer tallies at most this many of the most recent AI actions. */
@@ -1184,12 +1184,13 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     } catch {
       // The save effect will overwrite it with the fresh table anyway.
     }
-    setGame(startHand(undefined, { tier }));
+    // 按钮位随机:每次重置从不同位置开局,不然第一手永远是同一个座位视角。
+    setGame(startHand(undefined, { tier, dealerIndex: Math.floor(Math.random() * 8) }));
   }, [tier]);
 
   const resetGame = () => {
     const confirmed = window.confirm(
-      "重置对局会把牌桌回到第一手：所有座位按各自买入重新坐下，正在进行的这手作废。已存的牌谱保留。确定吗？",
+      "重置对局会把牌桌回到第一手：所有座位按各自买入重新坐下，按钮位随机，正在进行的这手作废。已存的牌谱保留。确定吗？",
     );
     if (!confirmed) return;
     resetTable();
@@ -1590,10 +1591,10 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
                   className={`reveal-toggle ${deepThink ? "on" : ""}`}
                   onClick={toggleDeepThink}
                   aria-pressed={deepThink}
-                  title="只在翻牌后、且你还在这手牌里时，让模型先想清楚再行动（思考有预算上限，通常多等 2~4 秒）。翻牌前和你弃牌后的 AI 互殴永远快答。"
+                  title="只在大池子、大注、全下这类关键决策上让模型真正想清楚（AI 会像真人一样 tank 10~25 秒）。其余决策一律秒答。"
                 >
                   <i />
-                  <span>深度思考（翻后对战时）</span>
+                  <span>深度思考（大决策）</span>
                 </button>
                 <label className="api-key-field">
                   <span>API Key</span>
