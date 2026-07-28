@@ -530,7 +530,8 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const [apiSettings, setApiSettings] = useState<BrowserApiSettings | null>(null);
   const [apiDraft, setApiDraft] = useState<BrowserApiSettings>({
     apiKey: "",
-    model: "deepseek-v4-pro",
+    // 默认 Flash:快答本来就靠它的速度,思考臂也是它;Pro 留给想换口味的人手动选。
+    model: "deepseek-v4-flash",
   });
   const [apiConnection, setApiConnection] = useState<ApiConnectionState>("idle");
   const [apiMessage, setApiMessage] = useState("");
@@ -848,7 +849,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const removeApiSettings = async () => {
     window.localStorage.removeItem(API_STORAGE_KEY);
     setApiSettings(null);
-    setApiDraft({ apiKey: "", model: "deepseek-v4-pro" });
+    setApiDraft({ apiKey: "", model: "deepseek-v4-flash" });
     setApiConnection("idle");
     setApiMessage("已移除本机保存的 API Key");
     try {
