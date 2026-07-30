@@ -22,7 +22,9 @@ test("Mist Table product shell replaces the disposable starter", async () => {
   assert.match(trainer, /一键清空记录/);
   assert.match(trainer, /method: "DELETE"/);
   assert.match(trainer, /player\.lastAction !== "fold"/);
-  assert.match(trainer, /player\.isHero && player\.stack <= 0/);
+  // 破产自动重买 + 一次性 add-on:两手之间给 hero 结算筹码的那段逻辑。
+  assert.match(trainer, /DEFAULT_HERO_REBUY_BB \* BIG_BLIND/);
+  assert.match(trainer, /pendingAddOnBB/);
   assert.match(trainer, /ALL-IN EV/);
   assert.match(trainer, /运气差/);
   assert.doesNotMatch(trainer, /className="hand-meta"/);

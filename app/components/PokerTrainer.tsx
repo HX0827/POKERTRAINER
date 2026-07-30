@@ -132,6 +132,8 @@ const LEGACY_PROGRESS_KEY = "mist-table-progress-v1";
  * that has genuinely changed gear is not judged on a session-old sample.
  */
 const DYNAMICS_WINDOW = 25;
+/** Hero 输光后的自动重买额度,固定值——加码走 Add-on,不跟这个搅在一起。 */
+const DEFAULT_HERO_REBUY_BB = 100;
 /**
  * Exploit instructions handed to the AIs, by tier. A casual table is not supposed to be
  * reading the human at all; a tough one gets everything `exploitDirectives` will produce.
@@ -523,8 +525,9 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
   const [deepThink, setDeepThink] = useState(true);
   const [showPlayers, setShowPlayers] = useState(false);
   const [showBuyIn, setShowBuyIn] = useState(false);
-  const [buyInBB, setBuyInBB] = useState(100);
   const [buyInDraft, setBuyInDraft] = useState(100);
+  /** 一次性 add-on:下一手开始前把这个数(BB)直接加到 hero 筹码上。赌场规则,手内不能加码。 */
+  const [pendingAddOnBB, setPendingAddOnBB] = useState<number | null>(null);
   const [hands, setHands] = useState<StoredHand[]>([]);
   const [apiReady, setApiReady] = useState(false);
   const [apiSettings, setApiSettings] = useState<BrowserApiSettings | null>(null);
@@ -744,10 +747,11 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
       dynamicsRef.current = [];
       decisionRecords.current.clear();
       setCopied(false);
+      setPendingAddOnBB(null);
       setTier(next);
-      setGame((current) => startHand(current, { tier: next, heroBuyInBB: buyInBB }));
+      setGame((current) => startHand(current, { tier: next, heroBuyInBB: DEFAULT_HERO_REBUY_BB }));
     },
-    [buyInBB, tier],
+    [tier],
   );
 
   const toggleRevealAll = useCallback(() => {
@@ -1139,14 +1143,19 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     decisionToken.current += 1;
     setCopied(false);
     pruneDecisionRecords(decisionRecords.current, game.handNo + 1);
+    // 筹码变动在两手之间结算(赌场规则):输光了自动重买 100BB;安排了 add-on 就把
+    // 选的数量直接加上去——两者可叠加(破产手 armed 了 add-on:100 + add-on)。一次性,用完即清。
+    const addOnBB = pendingAddOnBB;
+    if (addOnBB !== null) setPendingAddOnBB(null);
     setGame((current) => {
       const prepared: GameState = {
         ...current,
-        players: current.players.map((player) =>
-          player.isHero && player.stack <= 0
-            ? { ...player, stack: buyInBB * BIG_BLIND }
-            : player,
-        ),
+        players: current.players.map((player) => {
+          if (!player.isHero) return player;
+          const base = player.stack <= 0 ? DEFAULT_HERO_REBUY_BB * BIG_BLIND : player.stack;
+          const stack = base + (addOnBB ?? 0) * BIG_BLIND;
+          return stack === player.stack ? player : { ...player, stack };
+        }),
       };
       return startHand(prepared);
     });
@@ -1180,6 +1189,7 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
     decisionRecords.current.clear();
     loggedHand.current = 0;
     setCopied(false);
+    setPendingAddOnBB(null);
     try {
       window.localStorage.removeItem(GAME_STORAGE_KEY);
     } catch {
@@ -1226,13 +1236,10 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
           </div>
           <button
             className="buyin-button"
-            onClick={() => {
-              setBuyInDraft(buyInBB);
-              setShowBuyIn(true);
-            }}
+            onClick={() => setShowBuyIn(true)}
           >
-            <span>BUY-IN</span>
-            <b>{buyInBB}BB</b>
+            <span>ADD-ON</span>
+            <b>{pendingAddOnBB !== null ? `+${pendingAddOnBB}BB · 待加` : "加码"}</b>
           </button>
         </div>
         <div className="table-title">
@@ -1702,14 +1709,14 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
           <section className="buyin-modal" onClick={(event) => event.stopPropagation()}>
             <header>
               <div>
-                <span>TABLE BUY-IN</span>
-                <h2>设置 Hero 再买入</h2>
-                <p>盲注 1/2 · 仅在筹码输光后生效，不会重置下一手筹码</p>
+                <span>TABLE ADD-ON</span>
+                <h2>加码 Add-on</h2>
+                <p>盲注 1/2 · 下一手开始前把选的数量直接加到你的筹码上；输光自动重买 100BB</p>
               </div>
               <button onClick={() => setShowBuyIn(false)} aria-label="关闭">×</button>
             </header>
             <div className="buyin-options">
-              {[50, 100, 150, 200, 300].map((value) => (
+              {[50, 100, 200, 300, 500].map((value) => (
                 <button
                   key={value}
                   className={buyInDraft === value ? "selected" : ""}
@@ -1723,14 +1730,14 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
             </div>
             <div className="buyin-slider">
               <div>
-                <span>自定义买入</span>
+                <span>自定义加码</span>
                 <strong>{buyInDraft}BB</strong>
               </div>
               <input
-                aria-label="买入大盲数量"
+                aria-label="加码大盲数量"
                 type="range"
                 min={40}
-                max={300}
+                max={500}
                 step={10}
                 value={buyInDraft}
                 onChange={(event) => setBuyInDraft(Number(event.target.value))}
@@ -1739,12 +1746,24 @@ export function PokerTrainer({ initialGame }: { initialGame: GameState }) {
             <button
               className="buyin-confirm"
               onClick={() => {
-                setBuyInBB(buyInDraft);
+                setPendingAddOnBB(buyInDraft);
                 setShowBuyIn(false);
               }}
+              title="手内不能加码(赌场规则),下一手开始前筹码直接增加这个数量"
             >
-              保存再买入 {buyInDraft}BB
+              下一手 Add-on +{buyInDraft}BB（现有 {amountBB(hero.stack)}BB）
             </button>
+            {pendingAddOnBB !== null && (
+              <button
+                className="buyin-confirm buyin-secondary"
+                onClick={() => {
+                  setPendingAddOnBB(null);
+                  setShowBuyIn(false);
+                }}
+              >
+                取消待加的 +{pendingAddOnBB}BB
+              </button>
+            )}
           </section>
         </div>
       )}

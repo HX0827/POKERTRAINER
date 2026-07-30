@@ -1704,6 +1704,23 @@ kbd {
   cursor: pointer;
 }
 
+.buyin-confirm:disabled {
+  background: #3a3427;
+  color: #8f876e;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+/* 次要动作:只保存重买额度,不补码。 */
+.buyin-confirm.buyin-secondary {
+  margin-top: 0;
+  background: transparent;
+  border: 1px solid rgba(242, 196, 91, .35);
+  color: #d9b96a;
+  box-shadow: none;
+  font-weight: 650;
+}
+
 @media (max-width: 1050px) {
   .game-layout { grid-template-columns: 1fr; }
   .log-panel {
